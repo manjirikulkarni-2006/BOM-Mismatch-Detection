@@ -1,0 +1,29 @@
+# Node
+node_modules/
+frontend/node_modules/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Environment files
+.env
+.env.*
+
+
+# Python cache
+.pytest_cache/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+# Generated outputs
+outputs/
+
+# Trained model
+*.pth
