@@ -1780,6 +1780,31 @@ def similarity(
         canonical_compare_text(b)
     ).ratio()
 
+def normalize_description_for_comparison(
+    value: Any
+) -> str:
+    """
+    Normalize engineering descriptions for comparison.
+
+    This handles common OCR formatting differences such as:
+    - missing spaces
+    - quotation marks
+    - apostrophes
+
+    It does not remove meaningful separators such as
+    '/', '-', or '_'.
+    """
+    text = canonical_compare_text(value)
+
+    # Remove quote and apostrophe characters that are
+    # commonly lost during OCR.
+    text = text.replace('"', "")
+    text = text.replace("'", "")
+
+    # Ignore spacing differences.
+    text = re.sub(r"\s+", "", text)
+
+    return text
 
 def build_ground_truth_vocab(
     exclude_blueprint_id: Optional[str] = None
@@ -1955,16 +1980,38 @@ def values_match(
         detected
     )
 
-    if field in {
-        "DESCRIPTION",
-        "MATERIAL",
-    }:
-        # Allow small OCR differences.
+    if field == "DESCRIPTION":
+        expected_description = (
+            normalize_description_for_comparison(
+                expected
+            )
+        ) 
+
+        detected_description = (
+            normalize_description_for_comparison(
+                detected
+            )
+        )
+
+    # First check exact match after OCR-format
+    # normalization, then allow a small residual
+    # OCR difference.
+        return (
+            expected_description == detected_description
+            or similarity(
+                expected_description,
+                detected_description
+            ) >= 0.90
+        )
+
+
+    if field == "MATERIAL":
+        # Keep material comparison unchanged.
         return similarity(
             expected_text,
             detected_text
         ) >= 0.90
-
+    
     if field == "QTY":
         try:
             expected_number = float(
