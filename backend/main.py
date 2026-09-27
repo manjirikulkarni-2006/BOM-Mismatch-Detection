@@ -1,2292 +1,3090 @@
-from fastapi import FastAPI, UploadFile, File
-
-from fastapi.middleware.cors import CORSMiddleware
-
-from pathlib import Path
-import cv2
 import io
+import json
+import re
+from pathlib import Path
+from difflib import SequenceMatcher
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
+import pandas as pd
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from paddleocr import PPStructureV3
 
-import torch
-
-import easyocr
-
-from PIL import Image
-
-from transformers import LayoutLMv3Processor, LayoutLMv3ForTokenClassification
 
 # ============================================================
-
-# 1. APPLICATION SETUP
-
+# FASTAPI APP
 # ============================================================
 
 app = FastAPI(
     title="BOM Mismatch Detection API",
-    description="Deep Learning-Based BOM Mismatch Detection System",
-    version="1.0.0",
+    version="3.0"
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3001"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================
-
-# 2. MODEL CONFIGURATION
 
 # ============================================================
-
-BASE_MODEL = "microsoft/layoutlmv3-base"
-
-MODEL_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "model"
-    / "layoutlmv3_bom_corrected_best.pth"
-)
-
-LABELS = [
-    "O",
-    "B-PART_NO",
-    "I-PART_NO",
-    "B-DESCRIPTION",
-    "I-DESCRIPTION",
-    "B-MATERIAL",
-    "I-MATERIAL",
-    "B-UOM",
-    "I-UOM",
-    "B-QTY",
-    "I-QTY",
-]
-
-label2id = {label: idx for idx, label in enumerate(LABELS)}
-
-id2label = {idx: label for idx, label in enumerate(LABELS)}
-
+# PATHS
 # ============================================================
 
-# 3. DEVICE
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-# ============================================================
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# ============================================================
-
-# 4. LOAD LAYOUTLM PROCESSOR
-
-# ============================================================
-
-processor = LayoutLMv3Processor.from_pretrained(BASE_MODEL, apply_ocr=False)
-
-# ============================================================
-
-# 5. LOAD LAYOUTLM MODEL
-
-# ============================================================
-
-model = LayoutLMv3ForTokenClassification.from_pretrained(
-    BASE_MODEL, num_labels=len(LABELS), id2label=id2label, label2id=label2id
-)
-
-# ============================================================
-
-# 6. LOAD TRAINED WEIGHTS
-
-# ============================================================
-
-checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-
-model.load_state_dict(checkpoint["model_state_dict"])
-
-model.to(device)
-
-model.eval()
-
-# ============================================================
-
-# 7. LOAD EASYOCR
-
-# ============================================================
-
-reader = easyocr.Reader(["en"], gpu=torch.cuda.is_available())
-
-def run_bom_ocr(bom_crop):
-    """Run improved EasyOCR preprocessing and preserve original-crop coordinates."""
-    image_array = np.array(bom_crop)
-    scale = 2.0
-
-    gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
-    upscaled = cv2.resize(
-        gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
-    )
-    denoised = cv2.fastNlMeansDenoising(
-        upscaled, None, h=10, templateWindowSize=7, searchWindowSize=21
-    )
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(denoised)
-    binary = cv2.adaptiveThreshold(
-        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 11
-    )
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    processed = cv2.filter2D(binary, -1, kernel)
-
-    ocr_results = reader.readtext(
-        processed, detail=1, paragraph=False,
-        text_threshold=0.6, low_text=0.3, link_threshold=0.3,
-        mag_ratio=1.5, width_ths=0.4, height_ths=0.4,
-        contrast_ths=0.05, adjust_contrast=0.7
-    )
-
-    corrected_results = []
-    for bbox, text, confidence in ocr_results:
-        corrected_bbox = [
-            [float(point[0]) / scale, float(point[1]) / scale]
-            for point in bbox
-        ]
-        corrected_results.append((corrected_bbox, text, confidence))
-
-    return corrected_results
-
-
-# ============================================================
-
-# 8. OCR ROW RECONSTRUCTION
-
-# ============================================================
-
-
-def reconstruct_ocr_rows(ocr_results, y_tolerance=8):
-    """
-
-    Convert EasyOCR detections into rows.
-
-    EasyOCR returns:
-
-        (bbox, text, confidence)
-
-    Each row is sorted from left to right.
-
-    """
-
-    detections = []
-
-    for detection in ocr_results:
-
-        bbox, text, confidence = detection
-
-        bbox = [[float(point[0]), float(point[1])] for point in bbox]
-
-        text = str(text).strip()
-
-        if not text:
-
-            continue
-
-        xs = [point[0] for point in bbox]
-
-        ys = [point[1] for point in bbox]
-
-        center_x = sum(xs) / len(xs)
-
-        center_y = sum(ys) / len(ys)
-
-        height = max(ys) - min(ys)
-
-        detections.append(
-            {
-                "text": text,
-                "bbox": bbox,
-                "confidence": float(confidence),
-                "center_x": center_x,
-                "center_y": center_y,
-                "height": height,
-            }
-        )
-
-    # ---------------------------------------------------------
-
-    # Sort detections top-to-bottom
-
-    # ---------------------------------------------------------
-
-    detections.sort(key=lambda item: item["center_y"])
-
-    # ---------------------------------------------------------
-
-    # Group detections into rows
-
-    # ---------------------------------------------------------
-
-    rows = []
-
-    for detection in detections:
-
-        placed = False
-
-        for row in rows:
-
-            row_center_y = sum(item["center_y"] for item in row) / len(row)
-
-            if abs(detection["center_y"] - row_center_y) <= y_tolerance:
-
-                row.append(detection)
-
-                placed = True
-
-                break
-
-        if not placed:
-
-            rows.append([detection])
-
-    # ---------------------------------------------------------
-
-    # Sort each row left-to-right
-
-    # ---------------------------------------------------------
-
-    rows.sort(key=lambda row: min(item["center_y"] for item in row))
-
-    reconstructed_rows = []
-
-    for row_id, row in enumerate(rows):
-
-        row.sort(key=lambda item: item["center_x"])
-
-        reconstructed_rows.append(
-            {
-                "row_id": row_id,
-                "text": " | ".join(item["text"] for item in row),
-                "tokens": row,
-            }
-        )
-
-    return reconstructed_rows
-
-
-# ============================================================
-
-# 9. LAYOUTLMV3 BOM FIELD EXTRACTION
-
-# ============================================================
-
-
-def extract_bom_fields(rows, bom_crop):
-    """
-
-    Uses the trained LayoutLMv3 model to assign
-
-    OCR words to BOM fields.
-
-    """
-
-    extracted_rows = []
-
-    crop_width, crop_height = bom_crop.size
-
-    for row in rows:
-
-        tokens = row["tokens"]
-
-        if not tokens:
-
-            continue
-
-        # ----------------------------------------------------
-
-        # Prepare OCR words and bounding boxes
-
-        # ----------------------------------------------------
-
-        words = [token["text"] for token in tokens]
-
-        boxes = [token["bbox"] for token in tokens]
-
-        normalized_boxes = []
-
-        for bbox in boxes:
-
-            x_coordinates = [point[0] for point in bbox]
-
-            y_coordinates = [point[1] for point in bbox]
-
-            x0 = min(x_coordinates)
-
-            y0 = min(y_coordinates)
-
-            x1 = max(x_coordinates)
-
-            y1 = max(y_coordinates)
-
-            # Normalize coordinates to LayoutLM range 0-1000
-
-            x0 = int((x0 / crop_width) * 1000)
-
-            y0 = int((y0 / crop_height) * 1000)
-
-            x1 = int((x1 / crop_width) * 1000)
-
-            y1 = int((y1 / crop_height) * 1000)
-
-            normalized_boxes.append(
-                [
-                    max(0, min(1000, x0)),
-                    max(0, min(1000, y0)),
-                    max(0, min(1000, x1)),
-                    max(0, min(1000, y1)),
-                ]
-            )
-
-        # ----------------------------------------------------
-
-        # LayoutLMv3 encoding
-
-        # ----------------------------------------------------
-
-        encoding = processor(
-            images=bom_crop,
-            text=words,
-            boxes=normalized_boxes,
-            return_tensors="pt",
-            truncation=True,
-            padding="max_length",
-            max_length=256,
-        )
-
-        # Keep the original BatchEncoding object.
-
-        # This is required for encoding.word_ids().
-
-        model_inputs = {
-            key: value.to(device)
-            for key, value in encoding.items()
-            if isinstance(value, torch.Tensor)
-        }
-
-        # ----------------------------------------------------
-
-        # Model inference
-
-        # ----------------------------------------------------
-
-        with torch.no_grad():
-
-            outputs = model(**model_inputs)
-
-        predictions = torch.argmax(outputs.logits, dim=-1)[0].cpu().tolist()
-
-        # Map subword tokens back to original OCR words
-
-        word_ids = encoding.word_ids(batch_index=0)
-
-        # ----------------------------------------------------
-
-        # Store predicted fields
-
-        # ----------------------------------------------------
-
-        field_values = {
-            "PART_NO": [],
-            "DESCRIPTION": [],
-            "MATERIAL": [],
-            "UOM": [],
-            "QTY": [],
-        }
-
-        previous_word_id = None
-
-        for token_index, word_id in enumerate(word_ids):
-
-            if word_id is None:
-
-                continue
-
-            # Ignore additional subword tokens
-
-            if word_id == previous_word_id:
-
-                continue
-
-            previous_word_id = word_id
-
-            if word_id >= len(words):
-
-                continue
-
-            predicted_label = id2label[predictions[token_index]]
-
-            word = words[word_id]
-
-            if predicted_label in ["B-PART_NO", "I-PART_NO"]:
-
-                field_values["PART_NO"].append(word)
-
-            elif predicted_label in ["B-DESCRIPTION", "I-DESCRIPTION"]:
-
-                field_values["DESCRIPTION"].append(word)
-
-            elif predicted_label in ["B-MATERIAL", "I-MATERIAL"]:
-
-                field_values["MATERIAL"].append(word)
-
-            elif predicted_label in ["B-UOM", "I-UOM"]:
-
-                field_values["UOM"].append(word)
-
-            elif predicted_label in ["B-QTY", "I-QTY"]:
-
-                field_values["QTY"].append(word)
-
-        # ----------------------------------------------------
-
-        # Create structured BOM row
-
-        # ----------------------------------------------------
-
-        structured_row = {
-            "row_id": row["row_id"],
-            "PART_NO": " ".join(field_values["PART_NO"]).strip(),
-            "DESCRIPTION": " ".join(field_values["DESCRIPTION"]).strip(),
-            "MATERIAL": " ".join(field_values["MATERIAL"]).strip(),
-            "UOM": " ".join(field_values["UOM"]).strip(),
-            "QTY": " ".join(field_values["QTY"]).strip(),
-        }
-
-        extracted_rows.append(structured_row)
-
-    return extracted_rows
-
-
-# ============================================================
-
-# 10. BOM OUTPUT CLEANUP
-
-# ============================================================
-
-
-def clean_structured_bom(structured_bom):
-    """
-
-    Removes obvious title/header rows and empty rows.
-
-    """
-
-    cleaned_bom = []
-
-    for row in structured_bom:
-
-        values = {
-            key: str(row.get(key, "")).strip()
-            for key in ["PART_NO", "DESCRIPTION", "MATERIAL", "UOM", "QTY"]
-        }
-
-        combined_text = " ".join(values.values()).upper()
-
-        # Remove obvious title/header rows
-
-        if (
-            "BILL OF MATERIALS" in combined_text
-            or (
-                "DESCRIPTION" in combined_text
-                and ("MATERIAL" in combined_text or "MATL" in combined_text)
-            )
-            or ("PART NO" in combined_text and "QTY" in combined_text)
-        ):
-
-            continue
-
-        # Remove completely empty rows
-
-        if not any(values.values()):
-
-            continue
-
-        cleaned_bom.append({"row_id": row["row_id"], **values})
-
-    return cleaned_bom
-
-
-# ============================================================
-
-# PART NUMBER NORMALIZATION
-
-# ============================================================
-
-import re
-
-from difflib import SequenceMatcher
-
-
-def normalize_part_number(value, reference_part_numbers, threshold=0.85):
-    """
-
-    Normalize an OCR-extracted PART_NO against a
-
-    caller-supplied PART_NO vocabulary.
-
-    Returns the original value when no sufficiently
-
-    strong match exists.
-
-    NOTE (UPDATED): this is a LEGACY helper. It is NO LONGER CALLED
-    anywhere in the pipeline. The old comparison stage in
-    /analyze-blueprint passed it the CURRENT reference BOM's PART_NO
-    values, which let the evaluation reference influence the predicted
-    PART_NO (test-reference leakage). It is kept only so that no working
-    function is removed. Never call it with a reference/test BOM.
-    The training-only replacement is correct_part_number() in
-    section 10B below.
-    """
-
-    value = str(value).strip()
-
-    if not value:
-
-        return value
-
-    def canonical(text):
-
-        return re.sub(r"[^A-Z0-9]", "", str(text).upper())
-
-    candidate = canonical(value)
-
-    if not candidate:
-
-        return value
-
-    best_match = None
-
-    best_score = 0.0
-
-    for reference_part in reference_part_numbers:
-
-        reference_canonical = canonical(reference_part)
-
-        if not reference_canonical:
-
-            continue
-
-        score = SequenceMatcher(None, candidate, reference_canonical).ratio()
-
-        if score > best_score:
-
-            best_score = score
-
-            best_match = reference_part
-
-    if best_match is not None and best_score >= threshold:
-
-        return best_match
-
-    return value
-
-
-# ===== OCR IMPROVEMENT START =====
-#
-# ============================================================
-# 10B. TRAINING-ONLY OCR CORRECTION (PART_NO / DESCRIPTION / MATERIAL)
-# ============================================================
-#
-# GOAL
-# ----
-# Correct obvious OCR/LayoutLMv3 extraction noise in PART_NO, DESCRIPTION
-# and MATERIAL using vocabularies built ONLY from the training ground
-# truth, never from the reference/ground-truth row of the blueprint
-# currently being analyzed (the "test" blueprint). QTY/UOM are untouched.
-#
-# LEAKAGE GUARD
-# -------------
-# build_training_vocabularies() reads ONLY
-#   data/ground_truth/blueprint_ground_truth.csv
-# and explicitly EXCLUDES any row that belongs to the blueprint currently
-# being processed: (a) the row with the same filename stem, and (b) rows
-# that are augmentation variants of the same underlying blueprint
-# (e.g. "<id>" vs "<id>_noisy"), see _blueprint_base_id(). It NEVER reads
-# the uploaded --reference_bom CSV, and it never receives the
-# "reference"/"reference_rows" variables used later for comparison. This
-# is the only data source for correction.
-#
-# CONSERVATIVE MATCHING
-# ----------------------
-# 1. Canonicalize (uppercase, strip separators for comparison only).
-# 2. Exact canonical match against the training vocabulary -> confidence 1.0.
-# 3. Otherwise, fuzzy match against the training vocabulary. A correction
-#    is only ever applied if the resulting similarity score clears
-#    `threshold`. Nothing is substituted "blindly" -- a real vocabulary
-#    entry must still be found.
-# 4. If no confident match exists, the value is returned UNCHANGED
-#    (this preserves genuinely new/unknown part numbers, descriptions,
-#    and materials instead of forcing them onto the nearest vocabulary
-#    entry).
-#
-# PART_NO (UPDATED) uses a CONFUSION-WEIGHTED EDIT DISTANCE instead of
-# the earlier "single-character confusion variant + difflib ratio" probe.
-# The old probe could only forgive ONE confusable character per value, so
-# a PART_NO with several independent OCR confusions (A/4, Z/2, S/5 in the
-# same string) could never clear the threshold. The new method
-# (correct_part_number) charges a small cost for every confusable
-# substitution and a full cost for any other edit, so any NUMBER of
-# confusable characters is tolerated as long as the whole string stays
-# very close to a single training PART_NO, and the match is unambiguous.
-# DESCRIPTION and MATERIAL still use the earlier logic below, unchanged.
-#
-# DESCRIPTION uses two tiers: first a whole-phrase match against training
-# DESCRIPTION strings (catches full catalog phrases such as
-# "Lithonia LED Troffer 2x4"), and only if that is not confident enough,
-# a conservative WORD-BY-WORD correction against a training vocabulary of
-# individual words (catches things like "AwG" -> "AWG" inside an
-# otherwise-correct or novel description, without touching numbers/sizes
-# such as "2x4" or "1'").
-#
-# All thresholds below are deliberately conservative starting points.
-# They are ordinary keyword arguments / module constants -- raise them if
-# you see any false corrections in your own dataset, lower them if
-# genuinely-correct OCR is failing to match an obvious training vocabulary
-# entry.
-
-GROUND_TRUTH_CSV_PATH = (
-    Path(__file__).resolve().parent.parent
+GROUND_TRUTH_PATH = (
+    BASE_DIR
     / "data"
     / "ground_truth"
     / "blueprint_ground_truth.csv"
 )
 
-# Conservative single-character OCR confusion table for blueprint text.
-# Used only to WIDEN the vocabulary search, never to directly rewrite text.
-# (Still used by DESCRIPTION / MATERIAL correction. PART_NO now uses the
-# symmetric pair table further below.)
-_CHAR_CONFUSIONS = {
-    "O": "0",
-    "0": "O",
-    "I": "1",
-    "1": "I",
-    "L": "1",
-    "S": "5",
-    "5": "S",
-    "B": "8",
-    "8": "B",
-    "Z": "2",
-    "2": "Z",
-    "G": "6",
-    "6": "G",
-    "T": "7",
-    "7": "T",
-}
+LEGACY_MODEL_PATH = (
+    BASE_DIR
+    / "model"
+    / "layoutlmv3_bom_corrected_best.pth"
+)
 
-# ------------------------------------------------------------
-# PART_NO correction settings (added)
-# ------------------------------------------------------------
 
-# Symmetric OCR confusion pairs used by the confusion-weighted distance.
-# A pair is "confusable" in BOTH directions (A<->4 as well as 4<->A).
-_OCR_CONFUSION_PAIRS = [
-    ("A", "4"),
-    ("Z", "2"),
-    ("O", "0"),
-    ("Q", "0"),
-    ("D", "0"),
-    ("I", "1"),
-    ("L", "1"),
-    ("S", "5"),
-    ("B", "8"),
-    ("G", "6"),
-    ("T", "7"),
+# ============================================================
+# PP-STRUCTURE
+# ============================================================
+
+print("=" * 70)
+print("INITIALIZING PP-STRUCTUREV3")
+print("=" * 70)
+
+pipeline = PPStructureV3(lang="en")
+
+print("PP-StructureV3 initialized successfully.")
+print()
+
+
+# ============================================================
+# STANDARD BOM SCHEMA
+# ============================================================
+
+BOM_FIELDS = [
+    "PART_NO",
+    "DESCRIPTION",
+    "QTY",
+    "UOM",
+    "MATERIAL",
 ]
 
-_CONFUSABLE_PAIRS = {frozenset(pair) for pair in _OCR_CONFUSION_PAIRS}
 
-# Cost of substituting one confusable character for another.
-# Any other substitution / insertion / deletion costs 1.0.
-CONFUSION_SUB_COST = 0.30
+# ============================================================
+# FIELD ALIASES
+# ============================================================
 
-# Minimum similarity (1 - weighted_distance / longer_length) required
-# before a PART_NO is changed.
-PART_NO_CONFIDENCE_THRESHOLD = 0.90
-
-# The best training candidate must beat the runner-up by at least this
-# much, otherwise the correction is considered ambiguous and skipped.
-PART_NO_AMBIGUITY_MARGIN = 0.03
-
-# Very short values carry too little evidence for fuzzy correction
-# (exact training matches are still applied).
-PART_NO_MIN_LENGTH = 5
-
-# ------------------------------------------------------------
-# Train/test separation settings (added)
-# ------------------------------------------------------------
-
-# The ground-truth CSV holds every project blueprint, so the blueprint
-# being analyzed is excluded from the correction vocabulary. When True,
-# augmentation variants of the same underlying blueprint (same name plus
-# a suffix such as "_noisy") are excluded too, because a clean/noisy pair
-# shares the same BOM and would otherwise leak it into the vocabulary.
-EXCLUDE_AUGMENTATION_SIBLINGS = True
-
-_AUGMENTATION_SUFFIX_TOKENS = {
-    "noisy",
-    "noise",
-    "blur",
-    "blurred",
-    "rotated",
-    "rotate",
-    "skew",
-    "skewed",
-    "scan",
-    "scanned",
-    "aug",
-    "augmented",
-    "copy",
-    "dark",
-    "faded",
-    "lowres",
-    "compressed",
-    "clean",
-    "test",
+FIELD_ALIASES = {
+    "PART_NO": {
+        "partno",
+        "part_no",
+        "partnumber",
+        "part_number",
+        "part",
+        "itemno",
+        "item_no",
+        "itemnumber",
+        "item_number",
+        "item",
+        "componentno",
+        "component_no",
+        "componentnumber",
+        "component_number",
+        "stockno",
+        "stock_no",
+        "stocknumber",
+        "stock_number",
+    },
+    "DESCRIPTION": {
+        "description",
+        "desc",
+        "itemdescription",
+        "item_description",
+        "partdescription",
+        "part_description",
+        "componentdescription",
+        "component_description",
+        "name",
+        "itemname",
+        "item_name",
+    },
+    "QTY": {
+        "qty",
+        "quantity",
+        "count",
+        "amount",
+        "requiredqty",
+        "required_qty",
+    },
+    "UOM": {
+        "uom",
+        "unit",
+        "units",
+        "unitofmeasure",
+        "unit_of_measure",
+        "measure",
+    },
+    "MATERIAL": {
+        "material",
+        "matl",
+        "mat",
+        "materialtype",
+        "material_type",
+        "materialgrade",
+        "material_grade",
+        "grade",
+        "specification",
+        "spec",
+    },
 }
 
 
-def _blueprint_base_id(filename_stem):
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def safe_string(value: Any) -> str:
     """
-    Reduce a filename stem to the underlying blueprint identity by
-    stripping trailing augmentation tokens, e.g.
-        "<id>_noisy" -> "<id>",  "<id>" -> "<id>".
-    Used only to keep sibling variants of the CURRENT blueprint out of the
-    training vocabulary. It does not look at any BOM content.
+    Convert any value into a clean string.
     """
-    tokens = [
-        token
-        for token in re.split(r"[_\-\s]+", str(filename_stem or "").strip().lower())
-        if token
-    ]
+    if value is None:
+        return ""
 
-    while len(tokens) > 1 and tokens[-1] in _AUGMENTATION_SUFFIX_TOKENS:
-        tokens.pop()
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
 
-    return "_".join(tokens)
+    text = str(value).strip()
+
+    if text.lower() in {
+        "nan",
+        "none",
+        "null",
+        "<na>",
+        "nat",
+    }:
+        return ""
+
+    return text
 
 
-def _canonical(text):
-    """Uppercase and strip everything except letters/digits, for comparison only."""
-    return re.sub(r"[^A-Z0-9]", "", str(text).upper())
-
-
-def _confusion_variants(canonical_text):
+def normalize_text(value: Any) -> str:
     """
-    Generate conservative SINGLE-character-substitution variants of an
-    already-canonicalized string, using known blueprint OCR confusions.
-    Only one character is changed per variant (never combinatorial /
-    blind across the whole string). Always includes the original text.
+    General text normalization.
     """
-    variants = {canonical_text}
-    for i, ch in enumerate(canonical_text):
-        replacement = _CHAR_CONFUSIONS.get(ch)
-        if replacement:
-            variants.add(canonical_text[:i] + replacement + canonical_text[i + 1:])
-    return variants
+    text = safe_string(value)
 
-
-def _best_vocab_match(candidate_canonical, vocab_canonical_map, use_confusion=True):
-    """
-    candidate_canonical: canonical form of the OCR value being corrected.
-    vocab_canonical_map: dict {canonical_form: original_training_value}.
-    Returns (best_original_training_value_or_None, best_score).
-    """
-    if not candidate_canonical or not vocab_canonical_map:
-        return None, 0.0
-
-    search_forms = (
-        _confusion_variants(candidate_canonical)
-        if use_confusion
-        else {candidate_canonical}
-    )
-
-    best_value = None
-    best_score = 0.0
-
-    for form in search_forms:
-        for vocab_canonical, vocab_original in vocab_canonical_map.items():
-            score = SequenceMatcher(None, form, vocab_canonical).ratio()
-            if score > best_score:
-                best_score = score
-                best_value = vocab_original
-
-    return best_value, best_score
-
-
-def _confusion_weighted_distance(a, b):
-    """
-    Levenshtein-style edit distance where substituting two characters that
-    OCR commonly confuses (see _OCR_CONFUSION_PAIRS) costs
-    CONFUSION_SUB_COST, while every other substitution, insertion and
-    deletion costs 1.0. Operates on canonical (upper-case alphanumeric)
-    strings.
-    """
-    len_a = len(a)
-    len_b = len(b)
-
-    previous = [float(j) for j in range(len_b + 1)]
-
-    for i in range(1, len_a + 1):
-
-        current = [float(i)] + [0.0] * len_b
-
-        for j in range(1, len_b + 1):
-
-            char_a = a[i - 1]
-            char_b = b[j - 1]
-
-            if char_a == char_b:
-                substitution_cost = 0.0
-            elif frozenset((char_a, char_b)) in _CONFUSABLE_PAIRS:
-                substitution_cost = CONFUSION_SUB_COST
-            else:
-                substitution_cost = 1.0
-
-            current[j] = min(
-                previous[j] + 1.0,
-                current[j - 1] + 1.0,
-                previous[j - 1] + substitution_cost,
-            )
-
-        previous = current
-
-    return previous[len_b]
-
-
-def _confusion_similarity(a, b):
-    """Similarity in [0, 1]: 1 - weighted_distance / length_of_longer_string."""
-    longest = max(len(a), len(b))
-
-    if longest == 0:
-        return 0.0
-
-    return max(0.0, 1.0 - _confusion_weighted_distance(a, b) / longest)
-
-
-def _print_stage_banner(title):
-    """Terminal marker separating pipeline stages (model prediction /
-    OCR correction / final reference comparison) for viva explanation."""
-    print("\n" + "=" * 60)
-    print(title)
-    print("=" * 60)
-
-
-def _print_bom_snapshot(rows):
-    """Compact one-line-per-row dump of a structured BOM for debugging."""
-    for row in rows:
-        print(
-            f"  row {row.get('row_id')}: "
-            f"{row.get('PART_NO', '')} | {row.get('DESCRIPTION', '')} | "
-            f"{row.get('MATERIAL', '')} | {row.get('UOM', '')} | "
-            f"{row.get('QTY', '')}"
-        )
-
-
-def _print_correction_debug(field_name, raw, normalized, corrected, source, confidence):
-    """Debug trace: RAW -> NORMALIZED -> CORRECTED -> FINAL, per the academic
-    write-up requirement, so PART_NO/DESCRIPTION/MATERIAL corrections can be
-    explained during a viva."""
-    print(f"--- {field_name} ---")
-    print(f"RAW: {raw}")
-    print(f"NORMALIZED: {normalized}")
-    if source == "none":
-        print("CORRECTION: none")
-    else:
-        print(f"CORRECTED: {corrected}")
-        print(f"SOURCE: {source}")
-        print(f"CONFIDENCE: {confidence:.2f}")
-    print(f"FINAL: {corrected}")
-    print("-" * 50)
-
-
-def _print_part_no_debug(
-    raw,
-    normalized,
-    corrected,
-    source,
-    confidence,
-    best_candidate,
-    best_score,
-    runner_up,
-    runner_up_score,
-    note,
-):
-    """PART_NO-specific debug trace (OCR-correction stage only)."""
-    print("--- PART_NO (OCR correction, training vocabulary only) ---")
-    print(f"RAW OCR: {raw}")
-    print(f"NORMALIZED: {normalized}")
-    if source == "none":
-        print("CORRECTED: none")
-        print("SOURCE: none")
-        print("CONFIDENCE: n/a")
-    else:
-        print(f"CORRECTED: {corrected}")
-        print(f"SOURCE: {source}")
-        print(f"CONFIDENCE: {confidence:.2f}")
-    if best_candidate is not None:
-        print(f"BEST TRAINING CANDIDATE: {best_candidate} (score {best_score:.2f})")
-    if runner_up is not None:
-        print(f"RUNNER-UP: {runner_up} (score {runner_up_score:.2f})")
-    if note:
-        print(f"NOTE: {note}")
-    print(f"FINAL: {corrected}")
-    print("-" * 50)
-
-
-def build_training_vocabularies(exclude_filename_stem):
-    """
-    Build PART_NO / DESCRIPTION / MATERIAL correction vocabularies from the
-    TRAINING ground truth only (data/ground_truth/blueprint_ground_truth.csv),
-    explicitly excluding the row(s) belonging to the blueprint currently
-    being analyzed (`exclude_filename_stem`) so the test blueprint can never
-    leak into its own OCR correction.
-
-    Excluded rows:
-      1. the row whose filename stem equals `exclude_filename_stem`;
-      2. when EXCLUDE_AUGMENTATION_SIBLINGS is True, rows that share the
-         same underlying blueprint identity (same name after stripping
-         augmentation suffixes such as "_noisy").
-
-    Known limitation: the CSV does not say which blueprints the model was
-    trained on, so every OTHER row is treated as training data. A
-    dedicated train-split list would be needed for a stricter guarantee.
-    """
-
-    part_no_vocab = set()
-    description_phrase_vocab = set()
-    description_word_vocab = {}
-    material_vocab = set()
-
-    if not GROUND_TRUTH_CSV_PATH.exists():
-        return {
-            "part_no_vocab": part_no_vocab,
-            "description_phrase_vocab": description_phrase_vocab,
-            "description_word_vocab": description_word_vocab,
-            "material_vocab": material_vocab,
-        }
-
-    import pandas as pd
-    import json
-
-    gt_df = pd.read_csv(GROUND_TRUTH_CSV_PATH)
-
-    exclude_stem = str(exclude_filename_stem or "").strip().lower()
-    exclude_base = _blueprint_base_id(exclude_stem) if exclude_stem else ""
-
-    excluded_rows = []
-    used_rows = 0
-
-    for _, row in gt_df.iterrows():
-
-        gt_filename = Path(str(row.get("filename", ""))).stem.strip().lower()
-
-        # ----- LEAKAGE GUARD -----
-        # Skip the ground-truth row(s) belonging to the blueprint that is
-        # currently being processed. Everything else in this CSV is treated
-        # as "training data" for vocabulary purposes.
-        if exclude_stem:
-
-            if gt_filename == exclude_stem:
-                excluded_rows.append(gt_filename)
-                continue
-
-            if (
-                EXCLUDE_AUGMENTATION_SIBLINGS
-                and exclude_base
-                and _blueprint_base_id(gt_filename) == exclude_base
-            ):
-                excluded_rows.append(gt_filename)
-                continue
-
-        try:
-            data = json.loads(row["json_data"])
-        except (ValueError, TypeError, KeyError):
-            continue
-
-        used_rows += 1
-
-        for item in data.get("bill_of_materials", []):
-
-            part_no = str(item.get("part_no", "")).strip()
-            description = str(item.get("description", "")).strip()
-            material = str(item.get("material", "")).strip()
-
-            if part_no:
-                part_no_vocab.add(part_no)
-
-            if description:
-                description_phrase_vocab.add(description)
-                for word in description.split():
-                    word_key = re.sub(r"[^A-Za-z0-9]", "", word).upper()
-                    if word_key:
-                        description_word_vocab.setdefault(word_key, word)
-
-            if material:
-                material_vocab.add(material)
-
-    print(
-        f"[TRAINING VOCABULARY] excluded ground-truth rows for "
-        f"'{exclude_stem}': {excluded_rows if excluded_rows else 'none found'}"
-    )
-    print(
-        f"[TRAINING VOCABULARY] rows used: {used_rows} | "
-        f"PART_NO: {len(part_no_vocab)} | "
-        f"DESCRIPTION phrases: {len(description_phrase_vocab)} | "
-        f"MATERIAL: {len(material_vocab)}"
-    )
-
-    return {
-        "part_no_vocab": part_no_vocab,
-        "description_phrase_vocab": description_phrase_vocab,
-        "description_word_vocab": description_word_vocab,
-        "material_vocab": material_vocab,
-    }
-
-
-def _normalize_separators(text):
-    """Light, format-preserving normalization: uppercase, collapse
-    accidental whitespace, and tidy spaces around '-' and '/'."""
-    text = str(text or "").strip().upper()
+    text = text.replace("\n", " ")
+    text = text.replace("\r", " ")
     text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"\s*-\s*", "-", text)
-    text = re.sub(r"\s*/\s*", "/", text)
+
     return text.strip()
 
 
-def correct_whole_value(raw_value, vocab, threshold, field_name, use_confusion=True):
+def normalize_header(value: Any) -> str:
     """
-    Generic whole-value corrector used for MATERIAL (a closed/near-closed
-    vocabulary of catalog materials). PART_NO now uses
-    correct_part_number() below.
+    Normalize a table header so aliases can be recognized.
+
+    Example:
+        "PART NO." -> "partno"
+        "Part Number" -> "partnumber"
+        "MATERIAL / GRADE" -> "materialgrade"
     """
-    raw_value = str(raw_value or "")
-    normalized = _normalize_separators(raw_value)
+    text = normalize_text(value).lower()
 
-    corrected = normalized
-    source = "none"
-    confidence = 0.0
+    text = text.replace("&", "and")
 
-    candidate_canonical = _canonical(normalized)
+    # Remove common punctuation.
+    text = re.sub(r"[^a-z0-9]+", "", text)
 
-    if candidate_canonical and vocab:
-
-        vocab_canonical_map = {_canonical(v): v for v in vocab}
-
-        if candidate_canonical in vocab_canonical_map:
-            corrected = vocab_canonical_map[candidate_canonical]
-            source = "training vocabulary (exact)"
-            confidence = 1.0
-        else:
-            best_value, best_score = _best_vocab_match(
-                candidate_canonical, vocab_canonical_map, use_confusion=use_confusion
-            )
-            if best_value is not None and best_score >= threshold:
-                corrected = best_value
-                source = "training vocabulary (fuzzy)"
-                confidence = best_score
-
-    _print_correction_debug(
-        field_name, raw_value, normalized, corrected, source, confidence
-    )
-
-    return corrected
+    return text
 
 
-def correct_part_number(
-    raw_value,
-    vocab,
-    threshold=PART_NO_CONFIDENCE_THRESHOLD,
-    margin=PART_NO_AMBIGUITY_MARGIN,
-    min_length=PART_NO_MIN_LENGTH,
-):
+def canonical_field_from_header(header: Any) -> Optional[str]:
     """
-    Training-vocabulary-only PART_NO correction.
-
-    `vocab` must come from build_training_vocabularies(); the reference /
-    test BOM is never an input to this function.
-
-    Steps:
-      1. Normalize (uppercase, tidy separators) and canonicalize
-         (letters/digits only) the OCR value.
-      2. Exact canonical match in the training vocabulary -> use the
-         training spelling, confidence 1.0.
-      3. Otherwise score EVERY training PART_NO with a confusion-weighted
-         edit distance (confusable OCR substitutions such as A/4, Z/2,
-         O/0, I/1, L/1, S/5, B/8, G/6, Q/0, D/0 cost CONFUSION_SUB_COST;
-         all other edits cost 1.0), converted to a similarity in [0, 1].
-      4. Correct only if:
-           - the best similarity >= threshold, AND
-           - the best candidate beats the runner-up by at least `margin`
-             (otherwise the match is ambiguous), AND
-           - the value has at least `min_length` characters.
-      5. Otherwise keep the OCR value (only case/separator-normalized).
+    Convert an arbitrary table header into one of our
+    standard BOM fields.
     """
-    raw_value = str(raw_value or "")
-    normalized = _normalize_separators(raw_value)
-    candidate = _canonical(normalized)
+    normalized = normalize_header(header)
 
-    corrected = normalized
-    source = "none"
-    confidence = 0.0
+    if not normalized:
+        return None
 
-    best_value = None
-    best_score = 0.0
-    runner_up_value = None
-    runner_up_score = 0.0
-    note = ""
+    for field, aliases in FIELD_ALIASES.items():
+        if normalized in aliases:
+            return field
 
-    if candidate and vocab:
+    # More flexible matching for unusual headers.
+    if "part" in normalized and (
+        "no" in normalized
+        or "number" in normalized
+        or normalized == "part"
+    ):
+        return "PART_NO"
 
-        vocab_canonical_map = {}
+    if "item" in normalized and (
+        "no" in normalized
+        or "number" in normalized
+    ):
+        return "PART_NO"
 
-        for vocab_value in vocab:
-            vocab_key = _canonical(vocab_value)
-            if vocab_key:
-                vocab_canonical_map.setdefault(vocab_key, vocab_value)
+    if "desc" in normalized:
+        return "DESCRIPTION"
 
-        if candidate in vocab_canonical_map:
+    if "quantity" in normalized or normalized == "qty":
+        return "QTY"
 
-            corrected = vocab_canonical_map[candidate]
-            source = "training vocabulary (exact)"
-            confidence = 1.0
-            best_value = corrected
-            best_score = 1.0
+    if "unit" in normalized and (
+        "measure" in normalized
+        or normalized in {"unit", "units"}
+    ):
+        return "UOM"
 
-        elif len(candidate) >= min_length and vocab_canonical_map:
+    if normalized in {"uom", "unit"}:
+        return "UOM"
 
-            scored = sorted(
-                (
-                    (_confusion_similarity(candidate, vocab_key), vocab_value)
-                    for vocab_key, vocab_value in vocab_canonical_map.items()
-                ),
-                key=lambda item: (-item[0], item[1]),
-            )
+    if "material" in normalized:
+        return "MATERIAL"
 
-            best_score, best_value = scored[0]
+    if normalized in {"matl", "mat"}:
+        return "MATERIAL"
 
-            if len(scored) > 1:
-                runner_up_score, runner_up_value = scored[1]
+    if "grade" in normalized:
+        return "MATERIAL"
 
-            if best_score < threshold:
-
-                note = (
-                    f"best score {best_score:.2f} is below threshold "
-                    f"{threshold:.2f}; OCR value preserved"
-                )
-
-            elif (
-                runner_up_value is not None
-                and (best_score - runner_up_score) < margin
-            ):
-
-                note = (
-                    f"ambiguous: best and runner-up scores differ by less "
-                    f"than {margin:.2f}; OCR value preserved"
-                )
-
-            else:
-
-                corrected = best_value
-                source = "training vocabulary (confusion-weighted fuzzy)"
-                confidence = best_score
-
-        elif candidate:
-
-            note = (
-                f"value shorter than {min_length} characters; only exact "
-                f"training matches are applied"
-            )
-
-    elif candidate:
-
-        note = "training PART_NO vocabulary is empty; OCR value preserved"
-
-    _print_part_no_debug(
-        raw_value,
-        normalized,
-        corrected,
-        source,
-        confidence,
-        best_value,
-        best_score,
-        runner_up_value,
-        runner_up_score,
-        note,
-    )
-
-    return corrected
-
-
-def correct_description(
-    raw_value,
-    phrase_vocab,
-    word_vocab,
-    phrase_threshold=0.85,
-    word_threshold=0.80,
-):
-    """
-    Two-tier DESCRIPTION correction:
-      Tier 1: whole-phrase match against training DESCRIPTION strings.
-      Tier 2: conservative word-by-word correction against a training
-              word vocabulary, only replacing individual words that
-              clear `word_threshold`; unmatched/unknown words (including
-              sizes like "2x4" or "1'") are preserved untouched.
-    """
-    raw_value = str(raw_value or "")
-    normalized = re.sub(r"\s+", " ", raw_value.strip())
-
-    corrected = normalized
-    source = "none"
-    confidence = 0.0
-
-    if normalized:
-
-        # ---- Tier 1: whole-phrase match ----
-        phrase_canonical = _canonical(normalized)
-
-        if phrase_canonical and phrase_vocab:
-
-            phrase_vocab_map = {_canonical(p): p for p in phrase_vocab}
-
-            if phrase_canonical in phrase_vocab_map:
-                corrected = phrase_vocab_map[phrase_canonical]
-                source = "training vocabulary (phrase, exact)"
-                confidence = 1.0
-
-            else:
-                best_phrase, best_phrase_score = _best_vocab_match(
-                    phrase_canonical, phrase_vocab_map, use_confusion=False
-                )
-                if best_phrase is not None and best_phrase_score >= phrase_threshold:
-                    corrected = best_phrase
-                    source = "training vocabulary (phrase, fuzzy)"
-                    confidence = best_phrase_score
-
-        # ---- Tier 2: conservative word-level fallback ----
-        if source == "none" and word_vocab:
-
-            words = normalized.split(" ")
-            corrected_words = []
-            matched_scores = []
-            any_word_corrected = False
-
-            for word in words:
-
-                word_key = re.sub(r"[^A-Za-z0-9]", "", word).upper()
-
-                if not word_key:
-                    corrected_words.append(word)
-                    continue
-
-                if word_key in word_vocab:
-                    corrected_words.append(word_vocab[word_key])
-                    continue
-
-                best_word_value, best_word_score = _best_vocab_match(
-                    word_key, word_vocab, use_confusion=True
-                )
-
-                if best_word_value is not None and best_word_score >= word_threshold:
-                    corrected_words.append(best_word_value)
-                    matched_scores.append(best_word_score)
-                    any_word_corrected = True
-                else:
-                    # Preserve genuinely unknown/new words untouched.
-                    corrected_words.append(word)
-
-            if any_word_corrected:
-                corrected = " ".join(corrected_words)
-                source = "training vocabulary (word-level)"
-                confidence = min(matched_scores)
-
-    _print_correction_debug(
-        "DESCRIPTION", raw_value, normalized, corrected, source, confidence
-    )
-
-    return corrected
-
-
-def apply_ocr_corrections(structured_bom, vocabularies):
-    """
-    Applies training-vocabulary-only corrections to PART_NO, DESCRIPTION
-    and MATERIAL for every row. QTY and UOM are passed through unchanged.
-    """
-    part_no_vocab = vocabularies["part_no_vocab"]
-    description_phrase_vocab = vocabularies["description_phrase_vocab"]
-    description_word_vocab = vocabularies["description_word_vocab"]
-    material_vocab = vocabularies["material_vocab"]
-
-    corrected_bom = []
-
-    for row in structured_bom:
-
-        new_row = dict(row)
-
-        print(f"\n===== OCR CORRECTION (row_id={row.get('row_id')}) =====")
-
-        new_row["PART_NO"] = correct_part_number(
-            row.get("PART_NO", ""),
-            part_no_vocab,
-        )
-
-        new_row["DESCRIPTION"] = correct_description(
-            row.get("DESCRIPTION", ""),
-            description_phrase_vocab,
-            description_word_vocab,
-            phrase_threshold=0.85,
-            word_threshold=0.80,
-        )
-
-        new_row["MATERIAL"] = correct_whole_value(
-            row.get("MATERIAL", ""),
-            material_vocab,
-            threshold=0.82,
-            field_name="MATERIAL",
-            use_confusion=True,
-        )
-
-        corrected_bom.append(new_row)
-
-    return corrected_bom
-
-
-# ===== OCR IMPROVEMENT END =====
+    return None
 
 
 # ============================================================
-
-# 11. ROOT ENDPOINT
-
+# DATA VALIDATION
 # ============================================================
 
+def is_numeric(value: Any) -> bool:
+    """
+    Check whether a value represents a numeric quantity.
+    """
+    text = safe_string(value)
 
-@app.get("/")
-def root():
+    if not text:
+        return False
+
+    text = text.replace(",", "")
+    text = text.replace(" ", "")
+
+    # Allow values such as:
+    # 10
+    # 10.5
+    # 10.5kg
+    # 10 EA
+    match = re.fullmatch(
+        r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?:[a-zA-Z%]+)?",
+        text,
+    )
+
+    return match is not None
+
+
+def is_uom(value: Any) -> bool:
+    """
+    Detect common engineering BOM units.
+    """
+    text = normalize_text(value).upper()
+
+    if not text:
+        return False
+
+    common_units = {
+        "EA",
+        "EACH",
+        "PCS",
+        "PC",
+        "UNIT",
+        "UNITS",
+        "LF",
+        "FT",
+        "M",
+        "MM",
+        "CM",
+        "IN",
+        "KG",
+        "G",
+        "LB",
+        "LBS",
+        "TON",
+        "T",
+        "GAL",
+        "L",
+        "LOT",
+        "SET",
+        "SETS",
+        "BOX",
+        "BAG",
+        "ROLL",
+        "PAIR",
+        "PR",
+    }
+
+    if text in common_units:
+        return True
+
+    # Short alphabetic unit-like strings.
+    if 1 <= len(text) <= 5 and re.fullmatch(r"[A-Z0-9/.-]+", text):
+        return True
+
+    return False
+
+
+def looks_like_part_number(value: Any) -> bool:
+    text = normalize_text(value)
+
+    if not text:
+        return False
+
+    if len(text) > 80:
+        return False
+
+    # A part number normally contains alphanumeric content.
+    if not re.search(r"[A-Za-z0-9]", text):
+        return False
+
+    # Reject obvious long sentences.
+    if len(text.split()) > 8:
+        return False
+
+    return True
+
+
+def looks_like_description(value: Any) -> bool:
+    text = normalize_text(value)
+
+    if not text:
+        return False
+
+    if len(text) < 2 or len(text) > 250:
+        return False
+
+    return True
+
+
+def looks_like_material(value: Any) -> bool:
+    text = normalize_text(value)
+
+    if not text:
+        return False
+
+    if len(text) > 150:
+        return False
+
+    # Typical engineering material/specification patterns.
+    material_patterns = [
+        r"\bASTM\b",
+        r"\bA\d{2,4}\b",
+        r"\bSS\b",
+        r"\bSTAINLESS\b",
+        r"\bSTEEL\b",
+        r"\bALUMINUM\b",
+        r"\bALUMINIUM\b",
+        r"\bPVC\b",
+        r"\bHDPE\b",
+        r"\bCPVC\b",
+        r"\bBRASS\b",
+        r"\bCOPPER\b",
+        r"\bIRON\b",
+        r"\bGR\b",
+        r"\bGRADE\b",
+        r"\bSCH\b",
+        r"\bGALV\b",
+    ]
+
+    upper = text.upper()
+
+    if any(re.search(pattern, upper) for pattern in material_patterns):
+        return True
+
+    # Some datasets may simply contain short material names.
+    if len(text.split()) <= 6:
+        return True
+
+    return False
+
+
+def looks_like_bom_row(row: List[Any]) -> bool:
+    """
+    A row is considered a BOM row if the important fields
+    contain plausible values.
+
+    Material is NOT mandatory because real BOM tables may
+    legitimately leave it blank.
+    """
+    if len(row) < 5:
+        return False
+
+    values = [normalize_text(x) for x in row]
+
+    part_no = values[0]
+    description = values[1]
+    qty = values[2]
+    uom = values[3]
+    material = values[4]
+
+    core_valid = (
+        looks_like_part_number(part_no)
+        and looks_like_description(description)
+        and is_numeric(qty)
+        and is_uom(uom)
+    )
+
+    if not core_valid:
+        return False
+
+    # Material is optional.
+    if material:
+        return looks_like_material(material)
+
+    return True
+
+# ============================================================
+# TABLE EXTRACTION
+# ============================================================
+
+def html_to_variants(html: str) -> List[List[List[str]]]:
+    """
+    Convert PP-StructureV3 HTML into row matrices.
+
+    We intentionally parse the original HTML directly instead
+    of using pandas.read_html().
+
+    This preserves the cell structure produced by
+    PP-StructureV3 more faithfully.
+    """
+    if not html:
+        return []
+
+    try:
+        soup = BeautifulSoup(
+            html,
+            "html.parser"
+        )
+    except Exception:
+        return []
+
+    variants = []
+
+    # PP-StructureV3 normally gives one table, but support
+    # multiple HTML tables just in case.
+    html_tables = soup.find_all("table")
+
+    if not html_tables:
+        html_tables = [soup]
+
+    for html_table in html_tables:
+
+        rows = []
+
+        for tr in html_table.find_all("tr"):
+
+            cells = tr.find_all(
+                ["th", "td"]
+            )
+
+            values = [
+                normalize_text(
+                    cell.get_text(
+                        " ",
+                        strip=True
+                    )
+                )
+                for cell in cells
+            ]
+
+            if any(values):
+                rows.append(values)
+
+        if rows:
+            variants.append(rows)
+
+    return variants
+
+
+def get_table_variants(
+    table_result: Dict[str, Any]
+) -> List[List[List[str]]]:
+    """
+    Return all row matrices contained in one
+    PP-StructureV3 table result.
+    """
+    html = table_result.get(
+        "pred_html",
+        ""
+    )
+
+    return html_to_variants(html)
+
+
+def get_table_rows(
+    table_result: Dict[str, Any]
+) -> List[List[str]]:
+    """
+    Backward-compatible helper.
+    """
+    variants = get_table_variants(
+        table_result
+    )
+
+    if not variants:
+        return []
+
+    return max(
+        variants,
+        key=lambda rows: len(rows)
+    )
+
+
+# ============================================================
+# HEADER DETECTION
+# ============================================================
+
+def analyze_header(
+    row: List[Any]
+) -> Dict[str, Any]:
+    """
+    Analyze a possible BOM header row.
+    """
+    mapping = {}
+    recognized_fields = []
+
+    for index, value in enumerate(row):
+
+        field = canonical_field_from_header(
+            value
+        )
+
+        if field:
+
+            recognized_fields.append(
+                field
+            )
+
+            # Keep the first occurrence.
+            if field not in mapping:
+                mapping[field] = index
+
+    unique_count = len(
+        set(recognized_fields)
+    )
+
+    required_core = {
+        "PART_NO",
+        "DESCRIPTION",
+    }
+
+    has_core = required_core.issubset(
+        set(recognized_fields)
+    )
+
+    has_quantity_or_uom = (
+        "QTY" in recognized_fields
+        or "UOM" in recognized_fields
+    )
+
+    strong = (
+        has_core
+        and has_quantity_or_uom
+        and unique_count >= 3
+    )
+
+    duplicate_count = (
+        len(recognized_fields)
+        - unique_count
+    )
+
+    blank_count = sum(
+        1
+        for value in row
+        if not normalize_text(value)
+    )
+
+    score = (
+        unique_count * 2
+        + (3 if has_core else 0)
+        + (2 if has_quantity_or_uom else 0)
+        - duplicate_count * 1.5
+        - blank_count * 0.15
+    )
 
     return {
-        "message": "BOM Mismatch Detection API is running",
-        "model": "LayoutLMv3",
-        "device": str(device),
-        "model_loaded": True,
-        "ocr_loaded": True,
+        "mapping": mapping,
+        "recognized_fields": recognized_fields,
+        "unique_count": unique_count,
+        "duplicate_count": duplicate_count,
+        "blank_count": blank_count,
+        "strong": strong,
+        "score": score,
+    }
+
+
+def find_header(
+    rows: List[List[Any]]
+) -> Dict[str, Any]:
+    """
+    Search the first part of the table for a BOM header.
+    """
+    best = {
+        "index": -1,
+        "header": [],
+        "mapping": {},
+        "recognized_fields": [],
+        "unique_count": 0,
+        "duplicate_count": 0,
+        "blank_count": 0,
+        "strong": False,
+        "score": 0,
+    }
+
+    max_scan = min(
+        len(rows),
+        15
+    )
+
+    for index in range(max_scan):
+
+        analysis = analyze_header(
+            rows[index]
+        )
+
+        if analysis["score"] > best["score"]:
+
+            best = {
+                "index": index,
+                "header": rows[index],
+                **analysis,
+            }
+
+    return best
+
+
+# ============================================================
+# HEADER-BASED MAPPING
+# ============================================================
+
+def get_header_mapping(
+    header_info: Dict[str, Any]
+) -> Dict[str, int]:
+
+    return dict(
+        header_info.get(
+            "mapping",
+            {}
+        )
+    )
+
+
+# ============================================================
+# DATA-DRIVEN COLUMN ALIGNMENT
+# ============================================================
+
+def field_value_score(
+    field: str,
+    value: Any
+) -> float:
+    """
+    Score one cell according to the expected BOM field.
+
+    This is used to recover from table HTML where header
+    cells and data cells have slightly different positions
+    because of merged/blank cells.
+    """
+    text = normalize_text(value)
+
+    if field == "PART_NO":
+        return (
+            1.0
+            if looks_like_part_number(text)
+            else 0.0
+        )
+
+    if field == "DESCRIPTION":
+        return (
+            1.0
+            if looks_like_description(text)
+            else 0.0
+        )
+
+    if field == "QTY":
+        return (
+            1.0
+            if is_numeric(text)
+            else 0.0
+        )
+
+    if field == "UOM":
+        return (
+            1.0
+            if is_uom(text)
+            else 0.0
+        )
+
+    if field == "MATERIAL":
+
+        if not text:
+            # Blank material is valid.
+            return 0.50
+
+        return (
+            1.0
+            if looks_like_material(text)
+            else 0.0
+        )
+
+    return 0.0
+
+
+def mapping_row_score(
+    row: List[Any],
+    mapping: Dict[str, int]
+) -> float:
+    """
+    Score one row against one mapping.
+    """
+    try:
+        values = {
+            field: normalize_text(
+                row[mapping[field]]
+            )
+            for field in BOM_FIELDS
+        }
+
+    except (IndexError, KeyError):
+        return 0.0
+
+    score = 0.0
+
+    score += field_value_score(
+        "PART_NO",
+        values["PART_NO"]
+    ) * 1.0
+
+    score += field_value_score(
+        "DESCRIPTION",
+        values["DESCRIPTION"]
+    ) * 1.0
+
+    score += field_value_score(
+        "QTY",
+        values["QTY"]
+    ) * 1.5
+
+    score += field_value_score(
+        "UOM",
+        values["UOM"]
+    ) * 1.5
+
+    score += field_value_score(
+        "MATERIAL",
+        values["MATERIAL"]
+    ) * 0.5
+
+    return score / 5.5
+
+
+def score_mapping(
+    rows: List[List[Any]],
+    header_index: int,
+    mapping: Dict[str, int]
+) -> Tuple[float, int]:
+    """
+    Score a mapping over actual data rows.
+    """
+    data_rows = rows[
+        header_index + 1:
+    ]
+
+    if not data_rows:
+        return 0.0, 0
+
+    sample_rows = data_rows[:100]
+
+    scores = []
+
+    for row in sample_rows:
+
+        score = mapping_row_score(
+            row,
+            mapping
+        )
+
+        if score >= 0.60:
+            scores.append(score)
+
+    if not scores:
+        return 0.0, 0
+
+    return (
+        sum(scores) / len(scores),
+        len(scores)
+    )
+
+
+def mapping_valid_row_count(
+    rows: List[List[Any]],
+    header_index: int,
+    mapping: Dict[str, int]
+) -> int:
+    """
+    Count how many actual BOM rows are valid under
+    the supplied mapping.
+
+    Duplicate rows are intentionally counted separately.
+    """
+    count = 0
+
+    for row in rows[
+        header_index + 1:
+    ]:
+
+        if not row:
+            continue
+
+        try:
+            values = [
+                normalize_text(
+                    row[mapping[field]]
+                )
+                for field in BOM_FIELDS
+            ]
+
+        except (IndexError, KeyError):
+            continue
+
+        if looks_like_bom_row(values):
+            count += 1
+
+    return count
+
+
+def generate_nearby_mappings(
+    rows: List[List[Any]],
+    header_index: int,
+    header_mapping: Dict[str, int]
+) -> List[Dict[str, int]]:
+    """
+    Generate a small number of generalized mappings around
+    the detected header positions.
+
+    PP-StructureV3 can produce blank/merged header cells,
+    so the actual data column can be slightly left or right
+    of the header position.
+
+    We search only a small neighborhood rather than thousands
+    of arbitrary combinations.
+    """
+    if not header_mapping:
+        return []
+
+    max_columns = max(
+        len(row)
+        for row in rows
+    )
+
+    # Small shifts are enough for the type of HTML alignment
+    # issue seen in the noisy blueprint tables.
+    shifts = [-2, -1, 0, 1, 2]
+
+    candidates = []
+
+    # --------------------------------------------------------
+    # Build possible positions for every recognized field.
+    # --------------------------------------------------------
+
+    field_positions = {}
+
+    for field in BOM_FIELDS:
+
+        if field not in header_mapping:
+            continue
+
+        header_position = (
+            header_mapping[field]
+        )
+
+        positions = []
+
+        for shift in shifts:
+
+            position = (
+                header_position
+                + shift
+            )
+
+            if (
+                0 <= position
+                < max_columns
+            ):
+                positions.append(
+                    position
+                )
+
+        # Remove duplicates.
+        field_positions[field] = list(
+            dict.fromkeys(
+                positions
+            )
+        )
+
+    # We need all five BOM fields.
+    if any(
+        field not in field_positions
+        for field in BOM_FIELDS
+    ):
+        return []
+
+    # --------------------------------------------------------
+    # Generate combinations.
+    #
+    # Only five fields are involved and each field has at
+    # most five nearby positions.
+    # --------------------------------------------------------
+
+    candidates = []
+
+    def build(
+        field_index: int,
+        current: Dict[str, int],
+        used: set
+    ):
+        if field_index == len(
+            BOM_FIELDS
+        ):
+            candidates.append(
+                dict(current)
+            )
+            return
+
+        field = BOM_FIELDS[
+            field_index
+        ]
+
+        for position in field_positions[
+            field
+        ]:
+
+            if position in used:
+                continue
+
+            current[field] = position
+
+            used.add(position)
+
+            build(
+                field_index + 1,
+                current,
+                used
+            )
+
+            used.remove(position)
+
+            current.pop(
+                field,
+                None
+            )
+
+    build(
+        0,
+        {},
+        set()
+    )
+
+    # --------------------------------------------------------
+    # Remove duplicate mappings.
+    # --------------------------------------------------------
+
+    unique = []
+
+    seen = set()
+
+    for mapping in candidates:
+
+        key = tuple(
+            mapping[field]
+            for field in BOM_FIELDS
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append(mapping)
+
+    return unique
+
+
+def choose_mapping(
+    rows: List[List[Any]],
+    header_info: Dict[str, Any]
+):
+    """
+    Choose the best generalized BOM mapping.
+
+    Strategy:
+
+    1. Start from the detected BOM header.
+    2. Test the exact header positions.
+    3. Test only nearby positions.
+    4. Evaluate mappings using actual BOM row patterns.
+    5. Prefer mappings that recover the greatest number
+       of valid rows.
+    6. Use mapping quality as the tie breaker.
+
+    This is generalized and does not depend on any specific
+    blueprint or part number.
+    """
+
+    header_index = header_info[
+        "index"
+    ]
+
+    header_mapping = (
+        get_header_mapping(
+            header_info
+        )
+    )
+
+    if not header_mapping:
+        return (
+            None,
+            "",
+            0.0,
+            0
+        )
+
+    candidates = []
+
+    # Exact header mapping.
+    candidates.append(
+        (
+            header_mapping,
+            "HEADER"
+        )
+    )
+
+    # Nearby data-driven mappings.
+    nearby_mappings = (
+        generate_nearby_mappings(
+            rows,
+            header_index,
+            header_mapping
+        )
+    )
+
+    for mapping in nearby_mappings:
+
+        key = tuple(
+            mapping[field]
+            for field in BOM_FIELDS
+        )
+
+        existing_keys = {
+            tuple(
+                existing_mapping[field]
+                for field in BOM_FIELDS
+            )
+            for existing_mapping, _
+            in candidates
+        }
+
+        if key not in existing_keys:
+
+            candidates.append(
+                (
+                    mapping,
+                    "DATA_ALIGNED"
+                )
+            )
+
+    # --------------------------------------------------------
+    # Evaluate mappings.
+    # --------------------------------------------------------
+
+    best_mapping = None
+    best_source = ""
+    best_score = float("-inf")
+    best_valid_rows = -1
+
+    for mapping, source in candidates:
+
+        valid_rows = (
+            mapping_valid_row_count(
+                rows,
+                header_index,
+                mapping
+            )
+        )
+
+        mapping_score, scored_rows = (
+            score_mapping(
+                rows,
+                header_index,
+                mapping
+            )
+        )
+
+        # Prefer mappings that recover more actual rows.
+        #
+        # Mapping score only breaks ties.
+        final_score = (
+            valid_rows * 10.0
+            + mapping_score
+        )
+
+        # Exact header gets a very small preference only
+        # when the actual row count and quality are equal.
+        if source == "HEADER":
+            final_score += 0.001
+
+        if (
+            valid_rows > best_valid_rows
+            or (
+                valid_rows == best_valid_rows
+                and final_score > best_score
+            )
+        ):
+
+            best_mapping = mapping
+            best_source = source
+            best_score = final_score
+            best_valid_rows = valid_rows
+
+    return (
+        best_mapping,
+        best_source,
+        round(
+            best_score,
+            4
+        ),
+        best_valid_rows,
+    )
+
+
+# ============================================================
+# ROW EXTRACTION
+# ============================================================
+
+def extract_rows_from_mapping(
+    rows: List[List[Any]],
+    header_index: int,
+    mapping: Dict[str, int]
+) -> List[Dict[str, str]]:
+    """
+    Extract BOM rows using the selected mapping.
+
+    IMPORTANT:
+    No deduplication is performed.
+
+    If the same part number appears three times, all three
+    rows remain separate.
+    """
+    result = []
+
+    if not mapping:
+        return result
+
+    for row in rows[
+        header_index + 1:
+    ]:
+
+        if not row:
+            continue
+
+        try:
+
+            bom_row = {
+                field: normalize_text(
+                    row[mapping[field]]
+                )
+                for field in BOM_FIELDS
+            }
+
+        except (IndexError, KeyError):
+            continue
+
+        # Ignore repeated header rows.
+        if (
+            canonical_field_from_header(
+                bom_row["PART_NO"]
+            ) == "PART_NO"
+            and canonical_field_from_header(
+                bom_row["DESCRIPTION"]
+            ) == "DESCRIPTION"
+        ):
+            continue
+
+        # Ignore completely empty rows.
+        if (
+            not bom_row["PART_NO"]
+            and not bom_row["DESCRIPTION"]
+        ):
+            continue
+
+        values = [
+            bom_row["PART_NO"],
+            bom_row["DESCRIPTION"],
+            bom_row["QTY"],
+            bom_row["UOM"],
+            bom_row["MATERIAL"],
+        ]
+
+        if looks_like_bom_row(values):
+
+            # Do NOT deduplicate.
+            result.append(
+                bom_row
+            )
+
+    return result
+
+
+# ============================================================
+# TABLE SELECTION
+# ============================================================
+
+def select_bom_table(
+    table_results: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Search every PP-StructureV3 table and select the table
+    that contains the strongest BOM structure.
+
+    Selection is based on:
+      - BOM header quality
+      - number of valid BOM rows
+      - mapping quality
+
+    Duplicate BOM rows are preserved.
+    """
+    candidates = []
+
+    for table_index, table_result in enumerate(
+        table_results
+    ):
+
+        variants = get_table_variants(
+            table_result
+        )
+
+        for variant_index, rows in enumerate(
+            variants
+        ):
+
+            if not rows:
+                continue
+
+            header_info = find_header(
+                rows
+            )
+
+            if header_info["index"] < 0:
+                continue
+
+            # Require at least three recognizable BOM fields.
+            if (
+                header_info[
+                    "unique_count"
+                ] < 3
+            ):
+                continue
+
+            (
+                mapping,
+                mapping_source,
+                mapping_score,
+                valid_rows,
+            ) = choose_mapping(
+                rows,
+                header_info
+            )
+
+            if not mapping:
+                continue
+
+            bom_rows = (
+                extract_rows_from_mapping(
+                    rows,
+                    header_info["index"],
+                    mapping
+                )
+            )
+
+            if not bom_rows:
+                continue
+
+            # ------------------------------------------------
+            # Table selection score.
+            # ------------------------------------------------
+
+            selection_score = 0.0
+
+            # Header quality.
+            selection_score += (
+                header_info[
+                    "unique_count"
+                ] * 20
+            )
+
+            if header_info["strong"]:
+                selection_score += 30
+
+            # Actual extracted rows are very important.
+            selection_score += (
+                min(
+                    len(bom_rows),
+                    100
+                ) * 10
+            )
+
+            # Mapping quality.
+            selection_score += (
+                mapping_score
+            )
+
+            # Small preference for exact header alignment.
+            if mapping_source == "HEADER":
+                selection_score += 2
+
+            candidate = {
+                "table_index": table_index,
+                "variant_index": variant_index,
+                "rows": rows,
+                "header": header_info[
+                    "header"
+                ],
+                "header_index": header_info[
+                    "index"
+                ],
+                "mapping": mapping,
+                "mapping_source": mapping_source,
+                "mapping_score": round(
+                    mapping_score,
+                    4
+                ),
+                "valid_rows": len(
+                    bom_rows
+                ),
+                "bom": bom_rows,
+                "selection_score": round(
+                    selection_score,
+                    2
+                ),
+                "header_info": header_info,
+            }
+
+            candidates.append(
+                candidate
+            )
+
+    if not candidates:
+        return {
+            "selected": None,
+            "candidates": [],
+        }
+
+    candidates.sort(
+        key=lambda x: (
+            x["valid_rows"],
+            x["selection_score"],
+        ),
+        reverse=True
+    )
+
+    selected = candidates[0]
+
+    print()
+    print("=" * 70)
+    print("SELECTED BOM TABLE")
+    print("=" * 70)
+
+    print(
+        f"Table index: "
+        f"{selected['table_index']}"
+    )
+
+    print(
+        f"Variant index: "
+        f"{selected['variant_index']}"
+    )
+
+    print(
+        f"Header: "
+        f"{selected['header']}"
+    )
+
+    print(
+        f"Mapping: "
+        f"{selected['mapping']}"
+    )
+
+    print(
+        f"Mapping source: "
+        f"{selected['mapping_source']}"
+    )
+
+    print(
+        f"Mapping score: "
+        f"{selected['mapping_score']}"
+    )
+
+    print(
+        f"Valid BOM rows: "
+        f"{selected['valid_rows']}"
+    )
+
+    print(
+        f"Selection score: "
+        f"{selected['selection_score']}"
+    )
+
+    print("=" * 70)
+    print()
+
+    return {
+        "selected": selected,
+        "candidates": candidates,
+    }
+
+
+
+
+# ============================================================
+# PP-STRUCTURE BOM EXTRACTION
+# ============================================================
+
+def extract_bom_with_ppstructure(
+    image_path: str
+) -> Dict[str, Any]:
+    """
+    Run PP-StructureV3 and generalized BOM extraction.
+    """
+    print()
+    print("=" * 70)
+    print("PP-STRUCTUREV3 BOM EXTRACTION")
+    print("=" * 70)
+    print(f"Image: {image_path}")
+    print()
+
+    try:
+        output = pipeline.predict(
+            image_path
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"PP-StructureV3 failed: {exc}"
+        ) from exc
+
+    # Convert generator/list result into a list.
+    if not isinstance(output, list):
+        output = list(output)
+
+    table_results = []
+
+    for result in output:
+        if not isinstance(result, dict):
+            continue
+
+        tables = result.get(
+            "table_res_list",
+            []
+        )
+
+        if tables:
+            table_results.extend(
+                tables
+            )
+
+    if not table_results:
+        raise RuntimeError(
+            "No tables were detected by PP-StructureV3."
+        )
+
+    selection = select_bom_table(
+        table_results
+    )
+
+    selected = selection["selected"]
+
+    if selected is None:
+        raise RuntimeError(
+            "PP-StructureV3 detected tables, "
+            "but no valid BOM table could be identified."
+        )
+
+    return {
+        "bom": selected["bom"],
+        "table_index": selected["table_index"],
+        "variant_index": selected["variant_index"],
+        "header": selected["header"],
+        "mapping": selected["mapping"],
+        "mapping_source": selected["mapping_source"],
+        "mapping_score": selected["mapping_score"],
+        "selection_score": selected["selection_score"],
+        "valid_rows": selected["valid_rows"],
+        "candidate_count": len(
+            selection["candidates"]
+        ),
+        "raw_output": output,
     }
 
 
 # ============================================================
+# BLUEPRINT ID
+# ============================================================
 
-# 12. MODEL STATUS
+def extract_blueprint_id(filename: str) -> Optional[str]:
+    """
+    Extract the six-digit blueprint ID.
+
+    Example:
+        blueprint_300447_noisy.jpg
+        -> 300447
+    """
+    name = Path(filename).name
+
+    match = re.search(
+        r"(?<!\d)(\d{6})(?!\d)",
+        name
+    )
+
+    if match:
+        return match.group(1)
+
+    return None
+
 
 # ============================================================
+# GROUND TRUTH PARSING
+# ============================================================
+
+def standardize_bom_item(
+    item: Dict[str, Any]
+) -> Dict[str, str]:
+    """
+    Convert a ground-truth BOM dictionary into
+    the application's standard schema.
+    """
+    normalized_keys = {
+        normalize_header(key): key
+        for key in item.keys()
+    }
+
+    def get_value(
+        aliases: List[str]
+    ) -> Any:
+        for alias in aliases:
+            key = normalized_keys.get(
+                normalize_header(alias)
+            )
+
+            if key is not None:
+                return item[key]
+
+        return ""
+
+    return {
+        "PART_NO": normalize_text(
+            get_value([
+                "part_no",
+                "part number",
+                "part_no.",
+                "part",
+                "item_no",
+                "item number",
+            ])
+        ),
+        "DESCRIPTION": normalize_text(
+            get_value([
+                "description",
+                "desc",
+                "item description",
+            ])
+        ),
+        "QTY": normalize_text(
+            get_value([
+                "qty",
+                "quantity",
+            ])
+        ),
+        "UOM": normalize_text(
+            get_value([
+                "uom",
+                "unit",
+                "unit of measure",
+            ])
+        ),
+        "MATERIAL": normalize_text(
+            get_value([
+                "material",
+                "matl",
+                "material grade",
+                "grade",
+            ])
+        ),
+    }
+
+
+def load_reference_bom(
+    blueprint_id: Optional[str]
+) -> List[Dict[str, str]]:
+    """
+    Load the exact BOM for a blueprint from the 500-image
+    ground-truth CSV.
+
+    The dataset stores BOM data under:
+        json_data -> bill_of_materials
+    """
+    if not blueprint_id:
+        return []
+
+    if not GROUND_TRUTH_PATH.exists():
+        print(
+            f"Ground truth file not found: "
+            f"{GROUND_TRUTH_PATH}"
+        )
+        return []
+
+    try:
+        df = pd.read_csv(
+            GROUND_TRUTH_PATH
+        )
+    except Exception as exc:
+        print(
+            f"Failed to read ground truth CSV: {exc}"
+        )
+        return []
+
+    for _, record in df.iterrows():
+        filename = safe_string(
+            record.get("filename", "")
+        )
+
+        record_id = extract_blueprint_id(
+            filename
+        )
+
+        # Exact blueprint ID matching.
+        if record_id != blueprint_id:
+            continue
+
+        json_data = record.get(
+            "json_data",
+            ""
+        )
+
+        try:
+            data = json.loads(
+                json_data
+            )
+        except Exception as exc:
+            print(
+                f"Could not parse json_data for "
+                f"{filename}: {exc}"
+            )
+            return []
+
+        bom_items = data.get(
+            "bill_of_materials",
+            []
+        )
+
+        if not isinstance(
+            bom_items,
+            list
+        ):
+            return []
+
+        reference = []
+
+        for item in bom_items:
+            if not isinstance(
+                item,
+                dict
+            ):
+                continue
+
+            standardized = standardize_bom_item(
+                item
+            )
+
+            if any(
+                standardized.values()
+            ):
+                reference.append(
+                    standardized
+                )
+
+        print(
+            f"Reference BOM loaded for "
+            f"{blueprint_id}: "
+            f"{len(reference)} rows"
+        )
+
+        return reference
+
+    print(
+        f"No ground truth found for blueprint "
+        f"{blueprint_id}"
+    )
+
+    return []
+
+
+# ============================================================
+# OCR / TEXT CORRECTION
+# ============================================================
+
+def canonical_compare_text(
+    value: Any
+) -> str:
+    """
+    Normalize values for comparison.
+    """
+    text = normalize_text(value).upper()
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+def similarity(
+    a: Any,
+    b: Any
+) -> float:
+    return SequenceMatcher(
+        None,
+        canonical_compare_text(a),
+        canonical_compare_text(b)
+    ).ratio()
+
+
+def build_ground_truth_vocab(
+    exclude_blueprint_id: Optional[str] = None
+) -> Dict[str, List[str]]:
+    """
+    Build optional vocabulary from the ground truth dataset.
+
+    This is used only as a correction aid.
+    It is NOT required for the core table extraction.
+    """
+    vocab = {
+        "PART_NO": set(),
+        "DESCRIPTION": set(),
+        "MATERIAL": set(),
+    }
+
+    if not GROUND_TRUTH_PATH.exists():
+        return {
+            key: []
+            for key in vocab
+        }
+
+    try:
+        df = pd.read_csv(
+            GROUND_TRUTH_PATH
+        )
+    except Exception:
+        return {
+            key: []
+            for key in vocab
+        }
+
+    for _, record in df.iterrows():
+        filename = safe_string(
+            record.get("filename", "")
+        )
+
+        record_id = extract_blueprint_id(
+            filename
+        )
+
+        # Avoid using the current blueprint as its own
+        # correction source.
+        if (
+            exclude_blueprint_id
+            and record_id == exclude_blueprint_id
+        ):
+            continue
+
+        try:
+            data = json.loads(
+                record.get(
+                    "json_data",
+                    ""
+                )
+            )
+        except Exception:
+            continue
+
+        items = data.get(
+            "bill_of_materials",
+            []
+        )
+
+        if not isinstance(items, list):
+            continue
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            standardized = standardize_bom_item(
+                item
+            )
+
+            for field in vocab:
+                value = standardized[field]
+
+                if value:
+                    vocab[field].add(value)
+
+    return {
+        key: list(values)
+        for key, values in vocab.items()
+    }
+
+
+def correct_with_vocab(
+    value: str,
+    vocabulary: List[str],
+    threshold: float = 0.88
+) -> str:
+    """
+    Correct obvious OCR errors only when a close
+    ground-truth vocabulary match exists.
+    """
+    value = normalize_text(value)
+
+    if not value:
+        return value
+
+    if not vocabulary:
+        return value
+
+    best_value = value
+    best_score = 0.0
+
+    for candidate in vocabulary:
+        score = similarity(
+            value,
+            candidate
+        )
+
+        if score > best_score:
+            best_score = score
+            best_value = candidate
+
+    if best_score >= threshold:
+        return best_value
+
+    return value
+
+
+def correct_bom_ocr(
+    bom: List[Dict[str, str]],
+    blueprint_id: Optional[str]
+) -> List[Dict[str, str]]:
+    """
+    Apply conservative vocabulary-based correction.
+    """
+    vocab = build_ground_truth_vocab(
+        blueprint_id
+    )
+
+    corrected = []
+
+    for row in bom:
+        new_row = dict(row)
+
+        for field in [
+            "PART_NO",
+            "DESCRIPTION",
+            "MATERIAL",
+        ]:
+            new_row[field] = correct_with_vocab(
+                new_row[field],
+                vocab.get(field, [])
+            )
+
+        corrected.append(
+            new_row
+        )
+
+    return corrected
+
+
+# ============================================================
+# BOM COMPARISON
+# ============================================================
+
+def values_match(
+    field: str,
+    expected: Any,
+    detected: Any
+) -> bool:
+    """
+    Field-aware comparison.
+    """
+    expected_text = canonical_compare_text(
+        expected
+    )
+    detected_text = canonical_compare_text(
+        detected
+    )
+
+    if field in {
+        "DESCRIPTION",
+        "MATERIAL",
+    }:
+        # Allow small OCR differences.
+        return similarity(
+            expected_text,
+            detected_text
+        ) >= 0.90
+
+    if field == "QTY":
+        try:
+            expected_number = float(
+                expected_text.replace(",", "")
+            )
+            detected_number = float(
+                detected_text.replace(",", "")
+            )
+
+            return abs(
+                expected_number
+                - detected_number
+            ) < 1e-6
+        except Exception:
+            return expected_text == detected_text
+
+    return expected_text == detected_text
+
+
+def part_numbers_match(
+    expected: str,
+    detected: str
+) -> bool:
+    """
+    Slightly stricter part-number matching.
+    """
+    expected_text = canonical_compare_text(
+        expected
+    )
+    detected_text = canonical_compare_text(
+        detected
+    )
+
+    if expected_text == detected_text:
+        return True
+
+    return similarity(
+        expected_text,
+        detected_text
+    ) >= 0.94
+
+
+def compare_bom_rows(
+    reference_bom: List[Dict[str, str]],
+    detected_bom: List[Dict[str, str]]
+) -> Dict[str, Any]:
+    """
+    Occurrence-aware BOM comparison.
+
+    Important:
+    Duplicate part numbers are allowed.
+
+    Example:
+        W10x33
+        W10x33
+        W10x33
+
+    are treated as three separate BOM rows.
+    """
+    unmatched_detected = list(
+        range(len(detected_bom))
+    )
+
+    matched_pairs = []
+    missing_rows = []
+    extra_rows = []
+
+    # --------------------------------------------------------
+    # MATCH REFERENCE ROWS TO DETECTED ROWS
+    # --------------------------------------------------------
+
+    for ref_index, reference in enumerate(
+        reference_bom
+    ):
+        best_detected_index = None
+        best_score = -1.0
+
+        for detected_index in unmatched_detected:
+            detected = detected_bom[
+                detected_index
+            ]
+
+            # Part number is the primary key.
+            if part_numbers_match(
+                reference["PART_NO"],
+                detected["PART_NO"]
+            ):
+                score = 1.0
+
+                for field in BOM_FIELDS:
+                    if values_match(
+                        field,
+                        reference[field],
+                        detected[field]
+                    ):
+                        score += 0.2
+
+                if score > best_score:
+                    best_score = score
+                    best_detected_index = (
+                        detected_index
+                    )
+
+        # If no part number match, use a secondary
+        # fuzzy row comparison.
+        if best_detected_index is None:
+            for detected_index in unmatched_detected:
+                detected = detected_bom[
+                    detected_index
+                ]
+
+                score = 0.0
+
+                for field in BOM_FIELDS:
+                    if field == "PART_NO":
+                        score += (
+                            similarity(
+                                reference[field],
+                                detected[field]
+                            ) * 2
+                        )
+                    else:
+                        score += similarity(
+                            reference[field],
+                            detected[field]
+                        )
+
+                score /= (
+                    len(BOM_FIELDS) + 1
+                )
+
+                if score > best_score:
+                    best_score = score
+                    best_detected_index = (
+                        detected_index
+                    )
+
+        # Only accept fuzzy matching if sufficiently strong.
+        if (
+            best_detected_index is not None
+            and best_score >= 1.25
+        ):
+            unmatched_detected.remove(
+                best_detected_index
+            )
+
+            matched_pairs.append({
+                "reference": reference,
+                "detected": detected_bom[
+                    best_detected_index
+                ],
+                "reference_index": ref_index,
+                "detected_index": best_detected_index,
+            })
+
+        else:
+            missing_rows.append({
+                "reference": reference,
+                "reference_index": ref_index,
+            })
+
+    # Whatever remains was not found in reference.
+    for detected_index in unmatched_detected:
+        extra_rows.append({
+            "detected": detected_bom[
+                detected_index
+            ],
+            "detected_index": detected_index,
+        })
+
+    return {
+        "matched_pairs": matched_pairs,
+        "missing_rows": missing_rows,
+        "extra_rows": extra_rows,
+    }
+
+
+# ============================================================
+# FRONTEND COMPARISON FORMAT
+# ============================================================
+
+def build_frontend_comparison(
+    reference_bom: List[Dict[str, str]],
+    detected_bom: List[Dict[str, str]]
+) -> Dict[str, Any]:
+    """
+    Convert the internal row-level comparison into the
+    field-level structure expected by App.js.
+    """
+    internal = compare_bom_rows(
+        reference_bom,
+        detected_bom
+    )
+
+    results = []
+
+    matching_fields = 0
+    mismatched_fields = 0
+    missing_fields = 0
+    extra_fields = 0
+
+    # --------------------------------------------------------
+    # MATCHED ROWS
+    # --------------------------------------------------------
+
+    for pair in internal["matched_pairs"]:
+        reference = pair["reference"]
+        detected = pair["detected"]
+
+        for field in BOM_FIELDS:
+            expected = reference.get(
+                field,
+                ""
+            )
+
+            actual = detected.get(
+                field,
+                ""
+            )
+
+            if field == "PART_NO":
+                match = part_numbers_match(
+                    expected,
+                    actual
+                )
+            else:
+                match = values_match(
+                    field,
+                    expected,
+                    actual
+                )
+
+            status = (
+                "MATCH"
+                if match
+                else "MISMATCH"
+            )
+
+            if match:
+                matching_fields += 1
+            else:
+                mismatched_fields += 1
+
+            results.append({
+                "PART_NO": reference.get(
+                    "PART_NO",
+                    ""
+                ),
+                "FIELD": field,
+                "EXPECTED": expected,
+                "DETECTED": actual,
+                "STATUS": status,
+            })
+
+    # --------------------------------------------------------
+    # MISSING ROWS
+    # --------------------------------------------------------
+
+    for item in internal["missing_rows"]:
+        reference = item["reference"]
+
+        for field in BOM_FIELDS:
+            expected = reference.get(
+                field,
+                ""
+            )
+
+            if not expected:
+                continue
+
+            missing_fields += 1
+
+            results.append({
+                "PART_NO": reference.get(
+                    "PART_NO",
+                    ""
+                ),
+                "FIELD": field,
+                "EXPECTED": expected,
+                "DETECTED": "",
+                "STATUS": "MISSING",
+            })
+
+    # --------------------------------------------------------
+    # EXTRA ROWS
+    # --------------------------------------------------------
+
+    for item in internal["extra_rows"]:
+        detected = item["detected"]
+
+        for field in BOM_FIELDS:
+            actual = detected.get(
+                field,
+                ""
+            )
+
+            if not actual:
+                continue
+
+            extra_fields += 1
+
+            results.append({
+                "PART_NO": detected.get(
+                    "PART_NO",
+                    ""
+                ),
+                "FIELD": field,
+                "EXPECTED": "",
+                "DETECTED": actual,
+                "STATUS": "EXTRA",
+            })
+
+    total_fields_checked = (
+        matching_fields
+        + mismatched_fields
+        + missing_fields
+        + extra_fields
+    )
+
+    missing_rows = len(
+        internal["missing_rows"]
+    )
+
+    extra_rows = len(
+        internal["extra_rows"]
+    )
+
+    matched_rows = len(
+        internal["matched_pairs"]
+    )
+
+    # A row mismatch includes any field mismatch.
+    mismatched_rows = 0
+
+    for pair in internal["matched_pairs"]:
+        reference = pair["reference"]
+        detected = pair["detected"]
+
+        row_has_mismatch = False
+
+        for field in BOM_FIELDS:
+            if field == "PART_NO":
+                match = part_numbers_match(
+                    reference[field],
+                    detected[field]
+                )
+            else:
+                match = values_match(
+                    field,
+                    reference[field],
+                    detected[field]
+                )
+
+            if not match:
+                row_has_mismatch = True
+                break
+
+        if row_has_mismatch:
+            mismatched_rows += 1
+
+    return {
+        "results": results,
+        "summary": {
+            "total_fields_checked": total_fields_checked,
+            "matching_fields": matching_fields,
+            "mismatched_fields": mismatched_fields,
+            "missing_fields": missing_fields,
+            "extra_fields": extra_fields,
+            "matched_rows": matched_rows,
+            "mismatched_rows": mismatched_rows,
+            "missing_rows": missing_rows,
+            "extra_rows": extra_rows,
+        },
+        # Keep internal information available for debugging.
+        "internal": internal,
+    }
+
+
+# ============================================================
+# LEGACY / MODEL STATUS
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "message": "BOM Mismatch Detection API",
+        "version": "3.0",
+        "status": "running",
+        "extraction_engine": "PP-StructureV3",
+        "ground_truth": str(
+            GROUND_TRUTH_PATH
+        ),
+    }
 
 
 @app.get("/model-status")
 def model_status():
-
     return {
-        "model_loaded": True,
-        "ocr_loaded": True,
-        "device": str(device),
-        "model_path": str(MODEL_PATH),
-        "labels": LABELS,
+        "pp_structure_v3": True,
+        "legacy_layoutlm_model": (
+            LEGACY_MODEL_PATH.exists()
+        ),
+        "legacy_model_path": str(
+            LEGACY_MODEL_PATH
+        ),
+        "ground_truth_available": (
+            GROUND_TRUTH_PATH.exists()
+        ),
     }
 
 
 # ============================================================
-
-# 13. BLUEPRINT UPLOAD
-
+# UPLOAD BLUEPRINT
 # ============================================================
-
 
 @app.post("/upload-blueprint")
-async def upload_blueprint(file: UploadFile = File(...)):
-
-    # --------------------------------------------------------
-
-    # 1. Read uploaded image
-
-    # --------------------------------------------------------
-
-    image_bytes = await file.read()
-
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    width, height = image.size
-
-    # --------------------------------------------------------
-
-    # 2. Crop BOM region
-
-    #
-
-    # Current project-layout assumption:
-
-    # BOM is located in the lower-right region.
-
-    # --------------------------------------------------------
-
-    x1 = 760
-
-    y1 = 515
-
-    x2 = min(1245, width)
-
-    y2 = min(760, height)
-
-    bom_crop = image.crop((x1, y1, x2, y2))
-
-   
-# --------------------------------------------------------
-# 3. Improved EasyOCR
-# --------------------------------------------------------
-
-    ocr_results = run_bom_ocr(bom_crop)
-
-    # --------------------------------------------------------
-
-    # 5. Convert OCR results
-
-    # --------------------------------------------------------
-
-    detections = []
-
-    for bbox, text, confidence in ocr_results:
-
-        detections.append(
-            {
-                "text": text,
-                "bbox": [[int(point[0]), int(point[1])] for point in bbox],
-                "confidence": float(confidence),
-            }
+async def upload_blueprint(
+    file: UploadFile = File(...)
+):
+    """
+    Extract BOM only.
+    """
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="No filename supplied."
         )
 
-    # --------------------------------------------------------
+    extension = Path(
+        file.filename
+    ).suffix.lower()
 
-    # 6. Reconstruct OCR rows
-
-    # --------------------------------------------------------
-
-    rows = reconstruct_ocr_rows(ocr_results)
-
-    # --------------------------------------------------------
-
-    # 7. LayoutLMv3 field extraction
-
-    # --------------------------------------------------------
-
-    structured_bom = extract_bom_fields(rows, bom_crop)
-
-    # --------------------------------------------------------
-
-    # 8. Clean BOM output
-
-    # --------------------------------------------------------
-
-    structured_bom = clean_structured_bom(structured_bom)
-
-    _print_stage_banner("[STAGE 1] MODEL PREDICTION (LayoutLMv3, before any correction)")
-    _print_bom_snapshot(structured_bom)
-
-    # ===== OCR IMPROVEMENT START =====
-    # 8B. Training-vocabulary-only OCR correction (PART_NO/DESCRIPTION/MATERIAL)
-    _print_stage_banner("[STAGE 2] OCR CORRECTION (training vocabulary only)")
-
-    uploaded_filename_stem = (
-        Path(file.filename).stem.strip().lower() if file.filename else ""
-    )
-
-    training_vocabularies = build_training_vocabularies(
-        exclude_filename_stem=uploaded_filename_stem
-    )
-
-    structured_bom = apply_ocr_corrections(structured_bom, training_vocabularies)
-
-    _print_stage_banner("[STAGE 3] FINAL PREDICTED BOM (after OCR correction)")
-    _print_bom_snapshot(structured_bom)
-    # ===== OCR IMPROVEMENT END =====
-
-    # --------------------------------------------------------
-
-    # 9. Return result
-
-    # --------------------------------------------------------
-
-    return {
-        "status": "success",
-        "filename": file.filename,
-        "image_width": width,
-        "image_height": height,
-        "bom_crop": {
-            "x1": x1,
-            "y1": y1,
-            "x2": x2,
-            "y2": y2,
-            "width": x2 - x1,
-            "height": y2 - y1,
-        },
-        "ocr_detections": len(detections),
-        "ocr_rows": len(rows),
-        "bom": structured_bom,
+    allowed_extensions = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".bmp",
+        ".webp",
+        ".tif",
+        ".tiff",
     }
 
+    if extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported image format. "
+                "Use JPG, JPEG, PNG, BMP, WEBP, "
+                "TIF, or TIFF."
+            )
+        )
+
+    temp_dir = BASE_DIR / "output"
+
+    temp_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    temp_path = (
+        temp_dir
+        / f"_analysis_{file.filename}"
+    )
+
+    try:
+        content = await file.read()
+
+        with open(
+            temp_path,
+            "wb"
+        ) as f:
+            f.write(content)
+
+        extraction = (
+            extract_bom_with_ppstructure(
+                str(temp_path)
+            )
+        )
+
+        blueprint_id = (
+            extract_blueprint_id(
+                file.filename
+            )
+        )
+
+        corrected_bom = correct_bom_ocr(
+            extraction["bom"],
+            blueprint_id
+        )
+
+        return {
+            "success": True,
+            "filename": file.filename,
+            "blueprint_id": blueprint_id,
+            "extraction_method": (
+                "PP-StructureV3 + generalized parser"
+            ),
+            "bom": corrected_bom,
+            "extracted_bom": corrected_bom,
+            "bom_row_count": len(
+                corrected_bom
+            ),
+            "extracted_bom_rows": len(
+                corrected_bom
+            ),
+            "table_index": extraction[
+                "table_index"
+            ],
+            "variant_index": extraction[
+                "variant_index"
+            ],
+            "header": extraction[
+                "header"
+            ],
+            "mapping": extraction[
+                "mapping"
+            ],
+            "mapping_source": extraction[
+                "mapping_source"
+            ],
+            "mapping_score": extraction[
+                "mapping_score"
+            ],
+            "selection_score": extraction[
+                "selection_score"
+            ],
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc)
+        )
+
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+
 
 # ============================================================
-
-# 14. BOM MISMATCH DETECTION
-
+# CHECK BOM
 # ============================================================
-
-from pydantic import BaseModel
-
-from typing import List
-
-
-class BOMItem(BaseModel):
-
-    PART_NO: str
-
-    DESCRIPTION: str
-
-    MATERIAL: str
-
-    UOM: str
-
-    QTY: str
-
-
-class BOMComparisonRequest(BaseModel):
-
-    reference_bom: List[BOMItem]
-
-    detected_bom: List[BOMItem]
-
 
 @app.post("/check-bom")
-def check_bom(request: BOMComparisonRequest):
-
-    reference = {
-        item.PART_NO.strip(): item
-        for item in request.reference_bom
-        if item.PART_NO.strip()
-    }
-
-    detected = {
-        item.PART_NO.strip(): item
-        for item in request.detected_bom
-        if item.PART_NO.strip()
-    }
-
-    results = []
-
-    # --------------------------------------------------------
-
-    # Compare detected BOM against reference BOM
-
-    # --------------------------------------------------------
-
-    for part_no, detected_item in detected.items():
-
-        # Extra part
-
-        if part_no not in reference:
-
-            results.append(
-                {
-                    "PART_NO": part_no,
-                    "FIELD": "ROW",
-                    "EXPECTED": "Part should exist in reference BOM",
-                    "DETECTED": "Extra part",
-                    "STATUS": "MISMATCH",
-                }
-            )
-
-            continue
-
-        expected_item = reference[part_no]
-
-        fields = ["DESCRIPTION", "MATERIAL", "UOM", "QTY"]
-
-        for field in fields:
-
-            expected_value = str(getattr(expected_item, field)).strip()
-
-            detected_value = str(getattr(detected_item, field)).strip()
-
-            status = (
-                "MATCH" if expected_value == detected_value else "MISMATCH"
-            )
-
-            results.append(
-                {
-                    "PART_NO": part_no,
-                    "FIELD": field,
-                    "EXPECTED": expected_value,
-                    "DETECTED": detected_value,
-                    "STATUS": status,
-                }
-            )
-
-    # --------------------------------------------------------
-
-    # Detect missing parts
-
-    # --------------------------------------------------------
-
-    for part_no in reference:
-
-        if part_no not in detected:
-
-            results.append(
-                {
-                    "PART_NO": part_no,
-                    "FIELD": "ROW",
-                    "EXPECTED": "Part exists in reference BOM",
-                    "DETECTED": "Missing part",
-                    "STATUS": "MISMATCH",
-                }
-            )
-
-    # --------------------------------------------------------
-
-    # Calculate summary
-
-    # --------------------------------------------------------
-
-    total_fields = len(results)
-
-    matching_fields = sum(
-        1 for result in results if result["STATUS"] == "MATCH"
+async def check_bom(
+    payload: Dict[str, Any]
+):
+    """
+    Compare two BOM arrays supplied directly as JSON.
+    """
+    reference_bom = payload.get(
+        "reference_bom",
+        []
     )
 
-    mismatched_fields = sum(
-        1 for result in results if result["STATUS"] == "MISMATCH"
+    detected_bom = payload.get(
+        "detected_bom",
+        []
     )
 
-    overall_status = "MATCH" if mismatched_fields == 0 else "MISMATCH DETECTED"
+    if not isinstance(
+        reference_bom,
+        list
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="reference_bom must be a list."
+        )
+
+    if not isinstance(
+        detected_bom,
+        list
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="detected_bom must be a list."
+        )
+
+    comparison = build_frontend_comparison(
+        reference_bom,
+        detected_bom
+    )
+
+    summary = comparison["summary"]
 
     return {
-        "status": overall_status,
+        "success": True,
+        "comparison": comparison,
         "summary": {
-            "total_fields_checked": total_fields,
-            "matching_fields": matching_fields,
-            "mismatched_fields": mismatched_fields,
+            "matches": summary[
+                "matching_fields"
+            ],
+            "mismatches": summary[
+                "mismatched_fields"
+            ],
+            "missing": summary[
+                "missing_rows"
+            ],
+            "extra": summary[
+                "extra_rows"
+            ],
         },
-        "results": results,
     }
 
 
 # ============================================================
-
-# 15. COMPLETE BLUEPRINT ANALYSIS
-
+# ANALYZE BLUEPRINT
 # ============================================================
-
 
 @app.post("/analyze-blueprint")
 async def analyze_blueprint(
-    blueprint: UploadFile = File(...),
-    reference_bom: UploadFile | None = File(None),
+    file: UploadFile = File(...),
+    reference_bom_file: Optional[
+        UploadFile
+    ] = File(None),
 ):
     """
+    Complete pipeline:
 
-    Analyze an uploaded engineering blueprint.
+        Blueprint image
+              ↓
+        PP-StructureV3
+              ↓
+        Generalized table parser
+              ↓
+        BOM extraction
+              ↓
+        Optional OCR correction
+              ↓
+        Blueprint ID
+              ↓
+        Ground-truth lookup
+              ↓
+        Field-level comparison
+              ↓
+        Frontend-ready JSON
+    """
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="No filename supplied."
+        )
 
-    Reference BOM priority:
+    extension = Path(
+        file.filename
+    ).suffix.lower()
 
-    1. User-uploaded reference BOM
+    allowed_extensions = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".bmp",
+        ".webp",
+        ".tif",
+        ".tiff",
+    }
 
-    2. Project ground-truth BOM for known dataset blueprints
+    if extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported image format."
+            )
+        )
 
-    3. No comparison for unknown blueprints
+    temp_dir = BASE_DIR / "output"
 
-    The reference BOM is used ONLY in the final comparison/evaluation
-    stage. It is never used for OCR correction or to modify predictions.
+    temp_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
+    temp_path = (
+        temp_dir
+        / f"_analysis_{file.filename}"
+    )
+
+    try:
+        # ----------------------------------------------------
+        # SAVE IMAGE
+        # ----------------------------------------------------
+
+        content = await file.read()
+
+        with open(
+            temp_path,
+            "wb"
+        ) as f:
+            f.write(content)
+
+        # ----------------------------------------------------
+        # 1. EXTRACT BOM
+        # ----------------------------------------------------
+
+        extraction = (
+            extract_bom_with_ppstructure(
+                str(temp_path)
+            )
+        )
+
+        raw_bom = extraction[
+            "bom"
+        ]
+
+        # ----------------------------------------------------
+        # 2. BLUEPRINT ID
+        # ----------------------------------------------------
+
+        blueprint_id = (
+            extract_blueprint_id(
+                file.filename
+            )
+        )
+
+        # ----------------------------------------------------
+        # 3. OCR CORRECTION
+        # ----------------------------------------------------
+
+        corrected_bom = correct_bom_ocr(
+            raw_bom,
+            blueprint_id
+        )
+
+        # ----------------------------------------------------
+        # 4. LOAD REFERENCE BOM
+        # ----------------------------------------------------
+
+        reference_bom = []
+
+        # Optional uploaded reference JSON/CSV can be added
+        # later. For the current project, the 500-image
+        # ground-truth CSV is the default reference.
+        if (
+            reference_bom_file is not None
+            and reference_bom_file.filename
+        ):
+            reference_bom = (
+                await parse_uploaded_reference(
+                    reference_bom_file,
+                    blueprint_filename=file.filename,
+                )
+            )
+
+        if not reference_bom:
+            reference_bom = load_reference_bom(
+                blueprint_id
+            )
+
+        # ----------------------------------------------------
+        # 5. COMPARE
+        # ----------------------------------------------------
+
+        comparison = build_frontend_comparison(
+            reference_bom,
+            corrected_bom
+        )
+
+        comparison_summary = (
+            comparison["summary"]
+        )
+
+        # ----------------------------------------------------
+        # 6. LEGACY SUMMARY
+        # ----------------------------------------------------
+
+        legacy_summary = {
+            "detected_rows": len(
+                corrected_bom
+            ),
+            "reference_rows": len(
+                reference_bom
+            ),
+            "matches": comparison_summary[
+                "matching_fields"
+            ],
+            "mismatches": comparison_summary[
+                "mismatched_fields"
+            ],
+            "missing": comparison_summary[
+                "missing_rows"
+            ],
+            "extra": comparison_summary[
+                "extra_rows"
+            ],
+        }
+
+        # ----------------------------------------------------
+        # 7. FRONTEND RESPONSE
+        # ----------------------------------------------------
+
+        response = {
+            "success": True,
+
+            "filename": file.filename,
+
+            "blueprint_id": blueprint_id,
+
+            "extraction_method": (
+                "PP-StructureV3 + generalized parser"
+            ),
+
+            # New frontend contract.
+            "extracted_bom": corrected_bom,
+
+            "extracted_bom_rows": len(
+                corrected_bom
+            ),
+
+            "reference_bom": reference_bom,
+
+            "reference_bom_rows": len(
+                reference_bom
+            ),
+
+            # Current extraction does not expose individual
+            # OCR boxes because the application uses
+            # PP-StructureV3 table extraction.
+            "ocr_detections": None,
+
+            "ocr_rows": len(
+                corrected_bom
+            ),
+
+            "comparison": comparison,
+
+            "summary": legacy_summary,
+
+            "table_information": {
+                "table_index": extraction[
+                    "table_index"
+                ],
+                "variant_index": extraction[
+                    "variant_index"
+                ],
+                "header": extraction[
+                    "header"
+                ],
+                "mapping": extraction[
+                    "mapping"
+                ],
+                "mapping_source": extraction[
+                    "mapping_source"
+                ],
+                "mapping_score": extraction[
+                    "mapping_score"
+                ],
+                "selection_score": extraction[
+                    "selection_score"
+                ],
+                "candidate_count": extraction[
+                    "candidate_count"
+                ],
+            },
+
+            # Keep old key too, in case another part of
+            # the application still expects it.
+            "bom": corrected_bom,
+            "bom_row_count": len(
+                corrected_bom
+            ),
+        }
+
+        return response
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print()
+        print("=" * 70)
+        print("ANALYSIS ERROR")
+        print("=" * 70)
+        print(str(exc))
+        print("=" * 70)
+        print()
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc)
+        )
+
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+
+
+# ============================================================
+# OPTIONAL REFERENCE FILE SUPPORT
+# ============================================================
+
+async def parse_uploaded_reference(
+    uploaded_file: UploadFile,
+    blueprint_filename: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """
+    Parse a user-provided reference file.
+
+    Supports:
+      1. Simple BOM CSV:
+         PART_NO, DESCRIPTION, QTY, UOM, MATERIAL
+
+      2. Dataset ground-truth CSV:
+         filename, document_type, json_data
+
+      3. JSON BOM files.
     """
 
-    # ---------------------------------------------------------
+    filename = uploaded_file.filename or ""
 
-    # 1. Read uploaded blueprint
+    extension = Path(filename).suffix.lower()
 
-    # ---------------------------------------------------------
+    content = await uploaded_file.read()
 
-    image_bytes = await blueprint.read()
+    # --------------------------------------------------------
+    # CSV
+    # --------------------------------------------------------
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    width, height = image.size
-
-    # ---------------------------------------------------------
-
-    # 2. Select BOM crop
-
-    # ---------------------------------------------------------
-
-    dynamic_crop_dir = (
-        Path(__file__).resolve().parent.parent
-        / "outputs"
-        / "dynamic_bom_crops"
-    )
-
-    uploaded_stem = Path(blueprint.filename).stem.strip().lower()
-
-    dynamic_crop_path = dynamic_crop_dir / f"{uploaded_stem}_dynamic_bom.png"
-
-    if dynamic_crop_path.exists():
-
-        bom_crop = Image.open(dynamic_crop_path).convert("RGB")
-
-        crop_source = "saved_dynamic_crop"
-
-        x1 = 0
-
-        y1 = 0
-
-        x2 = bom_crop.width
-
-        y2 = bom_crop.height
-
-    else:
-
-        # Fallback for an unseen blueprint
-
-        x1 = 760
-
-        y1 = 515
-
-        x2 = min(1245, width)
-
-        y2 = min(760, height)
-
-        bom_crop = image.crop((x1, y1, x2, y2))
-
-        crop_source = "fallback_crop"
-
-    # ---------------------------------------------------------
-
-    # 3. OCR
-
-    # ---------------------------------------------------------
-
-    # Improved EasyOCR
-    ocr_results = run_bom_ocr(bom_crop)
-
-    rows = reconstruct_ocr_rows(ocr_results)
-
-    # ---------------------------------------------------------
-
-    # 4. LayoutLMv3 BOM extraction
-
-    # ---------------------------------------------------------
-
-    extracted_bom = extract_bom_fields(rows, bom_crop)
-
-    extracted_bom = clean_structured_bom(extracted_bom)
-
-    _print_stage_banner("[STAGE 1] MODEL PREDICTION (LayoutLMv3, before any correction)")
-    _print_bom_snapshot(extracted_bom)
-
-    # ===== OCR IMPROVEMENT START =====
-    # 4B. Training-vocabulary-only OCR correction (PART_NO/DESCRIPTION/MATERIAL)
-    #
-    # This runs BEFORE the reference BOM (user-uploaded or project ground
-    # truth) is even loaded below, and uses ONLY
-    # data/ground_truth/blueprint_ground_truth.csv with the current
-    # blueprint's own row (and its augmentation siblings) excluded. It
-    # therefore cannot see, and cannot be influenced by, whatever
-    # reference/ground-truth is used later for comparison -- preventing
-    # test-set leakage.
-    _print_stage_banner("[STAGE 2] OCR CORRECTION (training vocabulary only)")
-
-    training_vocabularies = build_training_vocabularies(
-        exclude_filename_stem=uploaded_stem
-    )
-
-    extracted_bom = apply_ocr_corrections(extracted_bom, training_vocabularies)
-
-    _print_stage_banner("[STAGE 3] FINAL PREDICTED BOM (after OCR correction)")
-    _print_bom_snapshot(extracted_bom)
-    # ===== OCR IMPROVEMENT END =====
-
-    # ---------------------------------------------------------
-
-    # 5. Determine reference BOM
-
-    reference = None
-    reference_source = None
-    comparison = None
-
-    # Use user-uploaded reference BOM when provided
-    if reference_bom is not None and reference_bom.filename:
-
-        reference_bytes = await reference_bom.read()
-        reference_text = reference_bytes.decode("utf-8-sig")
-
-        import csv
-
-        csv_reader = csv.DictReader(io.StringIO(reference_text))
-
-        reference = []
-
-        for row in csv_reader:
-            reference.append(
-                {
-                    "PART_NO": str(row.get("PART_NO", "")).strip(),
-                    "DESCRIPTION": str(row.get("DESCRIPTION", "")).strip(),
-                    "MATERIAL": str(row.get("MATERIAL", "")).strip(),
-                    "UOM": str(row.get("UOM", "")).strip(),
-                    "QTY": str(row.get("QTY", "")).strip(),
-                }
+    if extension == ".csv":
+        try:
+            df = pd.read_csv(
+                io.BytesIO(content)
             )
 
-        reference_source = "user_uploaded"
+            # ------------------------------------------------
+            # FORMAT 1:
+            # Simple BOM CSV
+            # ------------------------------------------------
 
-    # Otherwise use project ground truth when the uploaded
-    # filename belongs to the project dataset
-    else:
+            required_columns = {
+                "PART_NO",
+                "DESCRIPTION",
+                "QTY",
+                "UOM",
+                "MATERIAL",
+            }
 
-        ground_truth_path = (
-            Path(__file__).resolve().parent.parent
-            / "data"
-            / "ground_truth"
-            / "blueprint_ground_truth.csv"
-        )
+            if required_columns.issubset(
+                set(df.columns)
+            ):
+                rows = []
 
-        print("GROUND TRUTH PATH:", ground_truth_path)
-        print("GROUND TRUTH EXISTS:", ground_truth_path.exists())
-        print("UPLOADED FILENAME:", blueprint.filename)
+                for _, row in df.iterrows():
+                    item = {
+                        field: normalize_text(
+                            row.get(field, "")
+                        )
+                        for field in BOM_FIELDS
+                    }
 
-        if ground_truth_path.exists():
+                    if any(item.values()):
+                        rows.append(item)
 
-            import pandas as pd
-            import json
+                return rows
 
-            gt_df = pd.read_csv(ground_truth_path)
+            # ------------------------------------------------
+            # FORMAT 2:
+            # Dataset ground-truth CSV
+            #
+            # filename | document_type | json_data
+            # ------------------------------------------------
 
-            uploaded_filename = Path(blueprint.filename).stem.strip().lower()
+            if {
+                "filename",
+                "json_data",
+            }.issubset(set(df.columns)):
 
-            matching_files = gt_df[
-                gt_df["filename"]
-                .astype(str)
-                .apply(
-                    lambda x: Path(x).stem.strip().lower() == uploaded_filename
+                if not blueprint_filename:
+                    return []
+
+                target_filename = (
+                    Path(blueprint_filename)
+                    .name
+                    .strip()
+                    .lower()
                 )
-            ]["filename"].tolist()
 
-            print("MATCHES:", matching_files)
+                for _, record in df.iterrows():
 
-            for _, row in gt_df.iterrows():
-
-                gt_filename = Path(str(row["filename"])).stem.strip().lower()
-
-                if gt_filename != uploaded_filename:
-                    continue
-
-                data = json.loads(row["json_data"])
-
-                reference = []
-
-                for item in data["bill_of_materials"]:
-                    reference.append(
-                        {
-                            "PART_NO": str(item.get("part_no", "")).strip(),
-                            "DESCRIPTION": str(
-                                item.get("description", "")
-                            ).strip(),
-                            "MATERIAL": str(item.get("material", "")).strip(),
-                            "UOM": str(item.get("uom", "")).strip(),
-                            "QTY": str(item.get("qty", "")).strip(),
-                        }
+                    record_filename = (
+                        safe_string(
+                            record.get(
+                                "filename",
+                                ""
+                            )
+                        )
+                        .strip()
+                        .lower()
                     )
 
-                reference_source = "project_ground_truth"
+                    if (
+                        record_filename
+                        != target_filename
+                    ):
+                        continue
 
-                print("REFERENCE ROWS LOADED:", len(reference))
+                    json_data = safe_string(
+                        record.get(
+                            "json_data",
+                            ""
+                        )
+                    )
 
-                break
+                    try:
+                        data = json.loads(
+                            json_data
+                        )
+                    except Exception:
+                        return []
 
-        # NOTE: the old "PART_NO NORMALIZATION DIAGNOSTIC" block that used
-        # to live here has been REMOVED. It built its lookup vocabulary
-        # from this blueprint's own ground-truth `reference` rows, which is
-        # exactly the test-set leakage this update is meant to eliminate.
-        # The equivalent (and now leakage-safe) debug output is produced
-        # above by apply_ocr_corrections(), using build_training_vocabularies()
-        # instead of `reference`.
+                    bom_items = data.get(
+                        "bill_of_materials",
+                        []
+                    )
 
-    if reference is not None:
+                    if not isinstance(
+                        bom_items,
+                        list
+                    ):
+                        return []
 
-        _print_stage_banner(
-            "[STAGE 4] FINAL REFERENCE COMPARISON "
-            "(reference used for evaluation only; predictions are not modified)"
-        )
+                    rows = []
 
-        # -----------------------------------------------------
+                    for item in bom_items:
 
-        # 6. BOM comparison
+                        if not isinstance(
+                            item,
+                            dict
+                        ):
+                            continue
 
-        # -----------------------------------------------------
-
-        def normalize_compare_text(value):
-            """Normalize OCR formatting for comparison only."""
-
-            value = str(value or "").upper().strip()
-
-            return re.sub(r"\s+", "", value)
-
-        def normalize_compare_qty(value):
-            """Normalize quantity strings such as '476 . 0' and '476.0'."""
-
-            value = str(value or "").strip()
-
-            value = re.sub(r"\s+", "", value)
-
-            value = value.replace(",", "")
-
-            try:
-
-                return float(value)
-
-            except (ValueError, TypeError):
-
-                return None
-
-        def is_bom_header(row):
-
-            values = [
-                str(row.get("PART_NO", "")).strip().upper(),
-                str(row.get("DESCRIPTION", "")).strip().upper(),
-                str(row.get("MATERIAL", "")).strip().upper(),
-                str(row.get("UOM", "")).strip().upper(),
-                str(row.get("QTY", "")).strip().upper(),
-            ]
-
-            combined = " ".join(values)
-
-            return (
-                "BILL OF MATERIALS" in combined
-                or ("PART NO" in combined and "DESCRIPTION" in combined)
-                or ("DESCRIPTION" in combined and "MATERIAL" in combined)
-            )
-
-        # Remove header/empty rows before comparison.
-
-        reference_rows = [
-            row
-            for row in reference
-            if not is_bom_header(row)
-            and any(
-                str(row.get(field, "")).strip()
-                for field in [
-                    "PART_NO",
-                    "DESCRIPTION",
-                    "MATERIAL",
-                    "UOM",
-                    "QTY",
-                ]
-            )
-        ]
-
-        detected_rows = [
-            row
-            for row in extracted_bom
-            if not is_bom_header(row)
-            and any(
-                str(row.get(field, "")).strip()
-                for field in [
-                    "PART_NO",
-                    "DESCRIPTION",
-                    "MATERIAL",
-                    "UOM",
-                    "QTY",
-                ]
-            )
-        ]
-
-        # LEAKAGE FIX: the previous version built `reference_part_numbers`
-        # from the reference BOM and used normalize_part_number() to
-        # rewrite each DETECTED PART_NO toward the reference vocabulary.
-        # That let the evaluation reference change the prediction, so it
-        # has been removed. Both sides now keep their own PART_NO
-        # untouched; the detected value is the FINAL PREDICTED value from
-        # the training-only correction stage above.
-
-        for row in reference_rows:
-
-            row["_MATCH_PART_NO"] = str(row.get("PART_NO", "")).strip()
-
-        for row in detected_rows:
-
-            row["_MATCH_PART_NO"] = str(row.get("PART_NO", "")).strip()
-
-        comparison_rows = []
-
-        used_reference_indices = set()
-
-        fields = ["DESCRIPTION", "MATERIAL", "UOM", "QTY"]
-
-        def part_key(value):
-
-            return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
-
-        def find_reference_match(detected_item):
-            # Evaluation-side ROW ALIGNMENT only. It decides which
-            # reference row a predicted row is compared with; it never
-            # changes any predicted value.
-
-            detected_part = detected_item.get("_MATCH_PART_NO", "")
-
-            detected_key = part_key(detected_part)
-
-            candidates = []
-
-            for idx, ref_item in enumerate(reference_rows):
-
-                if idx in used_reference_indices:
-
-                    continue
-
-                ref_part = ref_item.get("_MATCH_PART_NO", "")
-
-                ref_key = part_key(ref_part)
-
-                if detected_key and detected_key == ref_key:
-
-                    candidates.append(idx)
-
-            # For duplicate PART_NO occurrences, use quantity
-
-            # to select the corresponding occurrence when possible.
-
-            if len(candidates) > 1:
-
-                detected_qty = normalize_compare_qty(
-                    detected_item.get("QTY", "")
-                )
-
-                if detected_qty is not None:
-
-                    qty_matches = []
-
-                    for idx in candidates:
-
-                        ref_qty = normalize_compare_qty(
-                            reference_rows[idx].get("QTY", "")
+                        standardized = (
+                            standardize_bom_item(
+                                item
+                            )
                         )
 
-                        if (
-                            ref_qty is not None
-                            and abs(ref_qty - detected_qty) < 1e-6
+                        if any(
+                            standardized.values()
                         ):
+                            rows.append(
+                                standardized
+                            )
 
-                            qty_matches.append(idx)
+                    return rows
 
-                    if qty_matches:
+                # Blueprint was not found
+                return []
 
-                        return qty_matches[0]
+            return []
 
-                return candidates[0]
+        except Exception:
+            return []
 
-            if len(candidates) == 1:
+    # --------------------------------------------------------
+    # JSON
+    # --------------------------------------------------------
 
-                return candidates[0]
+    if extension == ".json":
+        try:
+            data = json.loads(
+                content.decode("utf-8")
+            )
 
-            # Fuzzy fallback only when exact canonical PART_NO
-
-            # matching did not find a reference row. Used for alignment
-            # only: a row aligned this way is still reported with its
-            # PART_NO field as a MISMATCH below.
-
-            best_idx = None
-
-            best_score = 0.0
-
-            for idx, ref_item in enumerate(reference_rows):
-
-                if idx in used_reference_indices:
-
-                    continue
-
-                ref_key = part_key(ref_item.get("_MATCH_PART_NO", ""))
-
-                if not detected_key or not ref_key:
-
-                    continue
-
-                score = SequenceMatcher(None, detected_key, ref_key).ratio()
-
-                if score > best_score:
-
-                    best_score = score
-
-                    best_idx = idx
-
-            if best_idx is not None and best_score >= 0.80:
-
-                return best_idx
-
-            return None
-
-        # One-to-one occurrence-aware matching.
-
-        for detected_item in detected_rows:
-
-            detected_part = str(detected_item.get("PART_NO", "")).strip()
-
-            match_idx = find_reference_match(detected_item)
-
-            if match_idx is None:
-
-                comparison_rows.append(
-                    {
-                        "PART_NO": detected_part,
-                        "FIELD": "ROW",
-                        "EXPECTED": ("Part should exist in " "reference BOM"),
-                        "DETECTED": "Extra part",
-                        "STATUS": "MISMATCH",
-                    }
+            if isinstance(data, dict):
+                data = data.get(
+                    "bill_of_materials",
+                    data.get(
+                        "bom",
+                        data.get(
+                            "items",
+                            []
+                        )
+                    )
                 )
 
-                continue
+            if not isinstance(
+                data,
+                list
+            ):
+                return []
 
-            used_reference_indices.add(match_idx)
+            rows = []
 
-            expected_item = reference_rows[match_idx]
+            for item in data:
 
-            expected_part = str(expected_item.get("PART_NO", "")).strip()
+                if not isinstance(
+                    item,
+                    dict
+                ):
+                    continue
 
-            # PART_NO status is now computed honestly. Rows aligned by
-            # canonical PART_NO equality still report MATCH exactly as
-            # before; a row that was only aligned by the fuzzy fallback
-            # reports MISMATCH instead of being silently forgiven.
-
-            part_no_is_match = part_key(expected_part) == part_key(
-                detected_part
-            )
-
-            comparison_rows.append(
-                {
-                    "PART_NO": expected_part,
-                    "FIELD": "PART_NO",
-                    "EXPECTED": expected_part,
-                    "DETECTED": detected_part,
-                    "STATUS": ("MATCH" if part_no_is_match else "MISMATCH"),
-                }
-            )
-
-            for field in fields:
-
-                expected_value = str(expected_item.get(field, "")).strip()
-
-                detected_value = str(detected_item.get(field, "")).strip()
-
-                if field == "QTY":
-
-                    expected_qty = normalize_compare_qty(expected_value)
-
-                    detected_qty = normalize_compare_qty(detected_value)
-
-                    if expected_qty is not None and detected_qty is not None:
-
-                        is_match = abs(expected_qty - detected_qty) < 1e-6
-
-                    else:
-
-                        is_match = normalize_compare_text(
-                            expected_value
-                        ) == normalize_compare_text(detected_value)
-
-                else:
-
-                    is_match = normalize_compare_text(
-                        expected_value
-                    ) == normalize_compare_text(detected_value)
-
-                comparison_rows.append(
-                    {
-                        "PART_NO": expected_part,
-                        "FIELD": field,
-                        "EXPECTED": expected_value,
-                        "DETECTED": detected_value,
-                        "STATUS": ("MATCH" if is_match else "MISMATCH"),
-                    }
+                rows.append(
+                    standardize_bom_item(
+                        item
+                    )
                 )
 
-        # Reference rows not used above are missing after
+            return rows
 
-        # one-to-one matching.
+        except Exception:
+            return []
 
-        for idx, expected_item in enumerate(reference_rows):
+    return []
 
-            if idx in used_reference_indices:
 
-                continue
+# ============================================================
+# RUN DIRECTLY
+# ============================================================
 
-            part_no = str(expected_item.get("PART_NO", "")).strip()
+if __name__ == "__main__":
+    import uvicorn
 
-            comparison_rows.append(
-                {
-                    "PART_NO": part_no,
-                    "FIELD": "ROW",
-                    "EXPECTED": ("Part exists in " "reference BOM"),
-                    "DETECTED": "Missing part",
-                    "STATUS": "MISMATCH",
-                }
-            )
-
-        total_fields = len(comparison_rows)
-
-        matching_fields = sum(
-            1 for result in comparison_rows if result["STATUS"] == "MATCH"
-        )
-
-        mismatched_fields = sum(
-            1 for result in comparison_rows if result["STATUS"] == "MISMATCH"
-        )
-
-        comparison = {
-            "status": (
-                "MATCH" if mismatched_fields == 0 else "MISMATCH DETECTED"
-            ),
-            "summary": {
-                "total_fields_checked": (total_fields),
-                "matching_fields": (matching_fields),
-                "mismatched_fields": (mismatched_fields),
-                "reference_rows_compared": (len(reference_rows)),
-                "detected_rows_compared": (len(detected_rows)),
-            },
-            "results": comparison_rows,
-        }
-
-    # 7. Final response
-
-    # ---------------------------------------------------------
-
-    return {
-        "filename": blueprint.filename,
-        "image": {"width": width, "height": height},
-        "bom_crop": {
-            "source": crop_source,
-            "x1": x1,
-            "y1": y1,
-            "x2": x2,
-            "y2": y2,
-            "width": bom_crop.width,
-            "height": bom_crop.height,
-        },
-        "ocr_detections": len(ocr_results),
-        "ocr_rows": len(rows),
-        "extracted_bom_rows": len(extracted_bom),
-        "extracted_bom": extracted_bom,
-        "reference_available": (reference is not None),
-        "reference_source": reference_source,
-        "reference_bom_rows": (len(reference) if reference is not None else 0),
-        "comparison_available": (comparison is not None),
-        "comparison": comparison,
-        }
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=8000,
+    )

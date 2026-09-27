@@ -22,10 +22,10 @@ function App() {
 
     try {
       const formData = new FormData();
-      formData.append("blueprint", blueprint);
+      formData.append("file", blueprint);
 
       if (referenceBom) {
-        formData.append("reference_bom", referenceBom);
+        formData.append("reference_bom_file", referenceBom);
       }
 
       const response = await fetch(
@@ -200,7 +200,7 @@ function App() {
               </strong>
 
               <p>
-                OCR and LayoutLMv3 are extracting
+                OCR and table analysis are extracting
                 BOM information.
               </p>
             </div>
@@ -628,3 +628,4 @@ function ComparisonReport({ comparison }) {
 }
 
 export default App;
+
