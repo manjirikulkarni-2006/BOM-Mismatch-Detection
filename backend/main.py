@@ -2497,10 +2497,7 @@ async def upload_blueprint(
             )
         )
 
-        corrected_bom = correct_bom_ocr(
-            extraction["bom"],
-            blueprint_id
-        )
+        corrected_bom = raw_bom
 
         return {
             "success": True,
@@ -2597,6 +2594,29 @@ async def check_bom(
         reference_bom,
         detected_bom
     )
+    print("\n" + "=" * 70)
+    print("REFERENCE BOM")
+    print("=" * 70)
+
+    for row in reference_bom:
+        print(row)
+
+    print("\n" + "=" * 70)
+    print("DETECTED BOM")
+    print("=" * 70)
+
+    for row in corrected_bom:
+        print(row)
+
+    print("\n" + "=" * 70)
+    print("COMPARISON RESULTS")
+    print("=" * 70)
+
+    for result in comparison["results"]:
+        if result["STATUS"] != "MATCH":
+            print(result)
+
+    print("=" * 70)
 
     summary = comparison["summary"]
 
@@ -2733,10 +2753,7 @@ async def analyze_blueprint(
         # 3. OCR CORRECTION
         # ----------------------------------------------------
 
-        corrected_bom = correct_bom_ocr(
-            raw_bom,
-            blueprint_id
-        )
+        corrected_bom = raw_bom
 
         # ----------------------------------------------------
         # 4. LOAD REFERENCE BOM
@@ -2771,6 +2788,29 @@ async def analyze_blueprint(
             reference_bom,
             corrected_bom
         )
+        print("\n" + "=" * 70)
+        print("REFERENCE BOM")
+        print("=" * 70)
+
+        for i, row in enumerate(reference_bom):
+            print(i + 1, row)
+
+        print("\n" + "=" * 70)
+        print("DETECTED BOM")
+        print("=" * 70)
+
+        for i, row in enumerate(corrected_bom):
+            print(i + 1, row)
+
+        print("\n" + "=" * 70)
+        print("NON-MATCHING FIELDS")
+        print("=" * 70)
+
+        for result in comparison["results"]:
+            if result["STATUS"] != "MATCH":
+                print(result)
+
+        print("=" * 70)
 
         comparison_summary = (
             comparison["summary"]
@@ -2992,7 +3032,13 @@ async def parse_uploaded_reference(
                     .name
                     .strip()
                     .lower()
+                    .replace(".jpg.jpeg", ".jpg")
                 )
+                
+                print("\n===== UPLOADED REFERENCE DEBUG =====")
+                print("Uploaded CSV:", filename)
+                print("Blueprint filename:", target_filename)
+                print("CSV columns:", list(df.columns))
 
                 for _, record in df.iterrows():
 
@@ -3005,8 +3051,11 @@ async def parse_uploaded_reference(
                         )
                         .strip()
                         .lower()
+                        .replace(".jpg.jpeg", ".jpg")
                     )
 
+                    print("CSV filename:", record_filename)
+                    print("Comparing with:", target_filename)
                     if (
                         record_filename
                         != target_filename
