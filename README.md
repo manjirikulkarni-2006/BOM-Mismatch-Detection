@@ -48,6 +48,7 @@ This project automates BOM extraction, validation, correction of OCR errors, and
 * `UOM` – Unit of measurement
 * `MATERIAL` – Material or grade of the component
 
+**Project Structure**
 BOM-Mismatch-Detection/
 ├── backend/
 │   ├── main.py
